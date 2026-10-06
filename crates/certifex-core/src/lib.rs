@@ -4,6 +4,10 @@ use rcgen::{CertificateParams, CertificateSigningRequestParams, KeyPair, PublicK
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub const MAX_NODE_ID_BYTES: usize = 128;
+pub const MAX_HOSTNAMES: usize = 100;
+pub const MAX_CSR_PEM_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeConfig {
     pub node_id: String,
@@ -16,6 +20,10 @@ pub struct NodeConfig {
 pub enum ConfigError {
     #[error("node_id must not be empty")]
     EmptyNodeId,
+    #[error("node_id exceeds {MAX_NODE_ID_BYTES} bytes")]
+    NodeIdTooLong,
+    #[error("node config contains more than {MAX_HOSTNAMES} services")]
+    TooManyServices,
     #[error("domain must not be empty")]
     EmptyDomain,
     #[error("invalid DNS label `{0}`")]
@@ -28,6 +36,8 @@ pub enum ConfigError {
 pub enum IdentityError {
     #[error("certificate operation failed: {0}")]
     Certificate(#[from] rcgen::Error),
+    #[error("CSR contains a non-DNS subject alternative name")]
+    NonDnsSan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,8 +65,16 @@ pub struct RegistrationResponse {
 pub enum RegistrationError {
     #[error("node_id must not be empty")]
     EmptyNodeId,
+    #[error("node_id exceeds {MAX_NODE_ID_BYTES} bytes")]
+    NodeIdTooLong,
     #[error("registration contains no hostnames")]
     EmptyHostnames,
+    #[error("registration contains more than {MAX_HOSTNAMES} hostnames")]
+    TooManyHostnames,
+    #[error("invalid or non-canonical hostname `{0}`")]
+    InvalidHostname(String),
+    #[error("CSR PEM exceeds {MAX_CSR_PEM_BYTES} bytes")]
+    CsrTooLarge,
     #[error("registration hostnames are not canonical")]
     NonCanonicalHostnames,
     #[error("CSR SANs do not match registered hostnames")]
@@ -76,8 +94,22 @@ impl NodeRegistration {
         if self.node_id.trim().is_empty() {
             return Err(RegistrationError::EmptyNodeId);
         }
+        if self.node_id.len() > MAX_NODE_ID_BYTES {
+            return Err(RegistrationError::NodeIdTooLong);
+        }
         if self.hostnames.is_empty() {
             return Err(RegistrationError::EmptyHostnames);
+        }
+        if self.hostnames.len() > MAX_HOSTNAMES {
+            return Err(RegistrationError::TooManyHostnames);
+        }
+        if self.csr_pem.len() > MAX_CSR_PEM_BYTES {
+            return Err(RegistrationError::CsrTooLarge);
+        }
+        for hostname in &self.hostnames {
+            if hostname != &hostname.to_ascii_lowercase() || validate_domain(hostname).is_err() {
+                return Err(RegistrationError::InvalidHostname(hostname.clone()));
+            }
         }
 
         let mut canonical = self.hostnames.clone();
@@ -105,6 +137,12 @@ impl NodeConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.node_id.trim().is_empty() {
             return Err(ConfigError::EmptyNodeId);
+        }
+        if self.node_id.len() > MAX_NODE_ID_BYTES {
+            return Err(ConfigError::NodeIdTooLong);
+        }
+        if self.services.len() > MAX_HOSTNAMES {
+            return Err(ConfigError::TooManyServices);
         }
 
         let domain = normalize_domain(&self.domain)?;
@@ -197,11 +235,11 @@ pub fn csr_dns_names(csr_pem: &str) -> Result<Vec<String>, IdentityError> {
         .params
         .subject_alt_names
         .into_iter()
-        .filter_map(|san| match san {
-            SanType::DnsName(name) => Some(name.as_str().to_owned()),
-            _ => None,
+        .map(|san| match san {
+            SanType::DnsName(name) => Ok(name.as_str().to_owned()),
+            _ => Err(IdentityError::NonDnsSan),
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     names.sort_unstable();
     Ok(names)
 }
@@ -231,7 +269,7 @@ fn validate_label(label: &str) -> Result<(), ConfigError> {
         && !label.ends_with('-')
         && label
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
     if valid {
         Ok(())
     } else {
@@ -286,6 +324,89 @@ mod tests {
         assert_eq!(csr_dns_names(&first)?, names);
         assert_eq!(csr_dns_names(&second)?, names);
         Ok(())
+    }
+
+    #[test]
+    fn rejects_protocol_size_limits_before_csr_parse() {
+        let too_many = NodeRegistration {
+            node_id: "node".to_owned(),
+            tailscale_ip: IpAddr::from([100, 64, 0, 1]),
+            hostnames: (0..=MAX_HOSTNAMES)
+                .map(|index| format!("s{index}.example.com"))
+                .collect(),
+            csr_pem: String::new(),
+            installed_generation: None,
+        };
+        assert_eq!(
+            too_many.validate(),
+            Err(RegistrationError::TooManyHostnames)
+        );
+
+        let huge_csr = NodeRegistration {
+            node_id: "node".to_owned(),
+            tailscale_ip: IpAddr::from([100, 64, 0, 1]),
+            hostnames: vec!["one.example.com".to_owned()],
+            csr_pem: "x".repeat(MAX_CSR_PEM_BYTES + 1),
+            installed_generation: None,
+        };
+        assert_eq!(huge_csr.validate(), Err(RegistrationError::CsrTooLarge));
+
+        let long_id = NodeRegistration {
+            node_id: "n".repeat(MAX_NODE_ID_BYTES + 1),
+            tailscale_ip: IpAddr::from([100, 64, 0, 1]),
+            hostnames: vec!["one.example.com".to_owned()],
+            csr_pem: String::new(),
+            installed_generation: None,
+        };
+        assert_eq!(long_id.validate(), Err(RegistrationError::NodeIdTooLong));
+    }
+
+    #[test]
+    fn rejects_invalid_hostname_before_csr_parse() {
+        let registration = NodeRegistration {
+            node_id: "node".to_owned(),
+            tailscale_ip: IpAddr::from([100, 64, 0, 1]),
+            hostnames: vec!["_bad.example.com".to_owned()],
+            csr_pem: String::new(),
+            installed_generation: None,
+        };
+        assert!(matches!(
+            registration.validate(),
+            Err(RegistrationError::InvalidHostname(_))
+        ));
+    }
+
+    #[test]
+    fn csr_parser_rejects_non_dns_sans() -> Result<(), Box<dyn std::error::Error>> {
+        let key = KeyPair::generate()?;
+        let mut params = CertificateParams::new(vec!["one.example.com".to_owned()])?;
+        params
+            .subject_alt_names
+            .push(SanType::URI("spiffe://example/workload".try_into()?));
+        let csr = params.serialize_request(&key)?.pem()?;
+
+        assert!(matches!(csr_dns_names(&csr), Err(IdentityError::NonDnsSan)));
+        Ok(())
+    }
+
+    #[test]
+    fn node_config_enforces_service_and_identifier_limits() {
+        let mut too_many = config();
+        too_many.services = (0..=MAX_HOSTNAMES)
+            .map(|index| (format!("s{index}"), 443))
+            .collect();
+        assert_eq!(too_many.validate(), Err(ConfigError::TooManyServices));
+
+        let mut long_id = config();
+        long_id.node_id = "n".repeat(MAX_NODE_ID_BYTES + 1);
+        assert_eq!(long_id.validate(), Err(ConfigError::NodeIdTooLong));
+
+        let mut uppercase = config();
+        uppercase.services.insert("Grafana".to_owned(), 443);
+        assert_eq!(
+            uppercase.validate(),
+            Err(ConfigError::InvalidLabel("Grafana".to_owned()))
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::{
 use acme::{AcmeError, AcmeIssuer, RenewalSchedule};
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -32,6 +32,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 const LETS_ENCRYPT_STAGING: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
+const MAX_REGISTRATION_BODY_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Certifex registrar and certificate control plane")]
@@ -137,7 +138,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/healthz", get(health))
-        .route("/v1/register", post(register))
+        .route(
+            "/v1/register",
+            post(register).layer(DefaultBodyLimit::max(MAX_REGISTRATION_BODY_BYTES)),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
