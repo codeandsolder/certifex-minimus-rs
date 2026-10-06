@@ -11,11 +11,16 @@ certifex-core = { version = "0.1.0", path = "../certifex-core" }
 clap = { version = "4.6.7", features = ["derive"] }
 fastrand = "2.5.0"
 if-addrs = "0.15.0"
+pem = "4.0.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+thiserror = "2.0.21"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "time"] }
 toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+webpki-roots = "1.0.9"
+x509-parser = "0.18.1"
 
 [lints]
 workspace = true

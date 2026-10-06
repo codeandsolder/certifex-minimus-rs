@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, net::IpAddr};
 
-use rcgen::{CertificateParams, CertificateSigningRequestParams, KeyPair, SanType};
+use rcgen::{CertificateParams, CertificateSigningRequestParams, KeyPair, PublicKeyData, SanType};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -166,6 +166,12 @@ impl NodeIdentity {
     #[must_use]
     pub fn private_key_pem(&self) -> String {
         self.key_pair.serialize_pem()
+    }
+
+    /// Returns the node public key as DER-encoded `SubjectPublicKeyInfo`.
+    #[must_use]
+    pub fn public_key_spki_der(&self) -> Vec<u8> {
+        self.key_pair.subject_public_key_info()
     }
 
     /// Creates a signed CSR for the supplied DNS names without exposing the private key.

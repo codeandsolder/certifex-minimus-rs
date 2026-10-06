@@ -1,3 +1,5 @@
+mod certificate;
+
 use std::{
     fs, io,
     net::{IpAddr, Ipv4Addr},
@@ -5,7 +7,9 @@ use std::{
     time::Duration,
 };
 
-use certifex_core::{NodeConfig, NodeIdentity, NodeRegistration, RegistrationResponse};
+use certifex_core::{
+    CertificateBundle, NodeConfig, NodeIdentity, NodeRegistration, RegistrationResponse,
+};
 use clap::Parser;
 use reqwest::Client;
 use tokio::time::sleep;
@@ -73,14 +77,16 @@ async fn reconcile(client: &Client, args: &Args) -> Result<(), Box<dyn std::erro
     fs::create_dir_all(&args.state_dir)?;
 
     let key_path = args.state_dir.join("node-key.pem");
+    let generation_path = args.state_dir.join("certificate-generation");
     let identity = load_or_create_identity(&key_path)?;
     let csr_pem = identity.csr_pem(&hostnames)?;
+    let installed_generation = read_generation(&generation_path)?;
     let registration = NodeRegistration {
         node_id: config.node_id.clone(),
         tailscale_ip: detect_tailscale_ip()?,
         hostnames,
         csr_pem,
-        installed_generation: None,
+        installed_generation,
     };
 
     let endpoint = format!("{}/v1/register", config.registrar.trim_end_matches('/'));
@@ -94,16 +100,26 @@ async fn reconcile(client: &Client, args: &Args) -> Result<(), Box<dyn std::erro
         .await?;
 
     if let Some(certificate) = response.certificate {
+        if installed_generation.is_some_and(|generation| certificate.generation < generation) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "registrar attempted certificate generation rollback",
+            )
+            .into());
+        }
+        certificate::validate_bundle(&certificate, &registration.hostnames, &identity)?;
+        install_certificate(&args.state_dir, &certificate)?;
         info!(
             node_id = %config.node_id,
             generation = certificate.generation,
-            "registrar returned a certificate generation; installation is not enabled yet"
+            "validated and installed certificate generation"
         );
     } else {
         info!(
             node_id = %config.node_id,
             tailscale_ip = %registration.tailscale_ip,
             names = registration.hostnames.len(),
+            installed_generation = ?installed_generation,
             "registration reconciled"
         );
     }
@@ -120,6 +136,43 @@ fn load_or_create_identity(path: &Path) -> Result<NodeIdentity, Box<dyn std::err
     let identity = NodeIdentity::generate()?;
     write_private_key(path, &identity.private_key_pem())?;
     Ok(identity)
+}
+
+fn read_generation(path: &Path) -> io::Result<Option<u64>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let value = fs::read_to_string(path)?;
+    value
+        .trim()
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn install_certificate(state_dir: &Path, certificate: &CertificateBundle) -> io::Result<()> {
+    atomic_write(
+        &state_dir.join("certificate.pem"),
+        certificate.certificate_chain_pem.as_bytes(),
+    )?;
+    atomic_write(
+        &state_dir.join("certificate-generation"),
+        certificate.generation.to_string().as_bytes(),
+    )
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+
+    let temporary = path.with_extension("tmp");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temporary)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    fs::rename(temporary, path)
 }
 
 fn detect_tailscale_ip() -> io::Result<IpAddr> {
