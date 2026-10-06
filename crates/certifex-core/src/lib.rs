@@ -66,6 +66,12 @@ pub enum RegistrationError {
 }
 
 impl NodeRegistration {
+    /// Validates the registration's identity and CSR name set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the node ID or hostname set is invalid, the CSR cannot be
+    /// parsed and verified, or the CSR SANs differ from the declared hostnames.
     pub fn validate(&self) -> Result<(), RegistrationError> {
         if self.node_id.trim().is_empty() {
             return Err(RegistrationError::EmptyNodeId);
@@ -91,6 +97,11 @@ impl NodeRegistration {
 }
 
 impl NodeConfig {
+    /// Validates the node identifier, base domain, service labels, and ports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an identifier, DNS label, or service port is invalid.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.node_id.trim().is_empty() {
             return Err(ConfigError::EmptyNodeId);
@@ -109,6 +120,11 @@ impl NodeConfig {
         Ok(())
     }
 
+    /// Expands configured service labels into canonical fully qualified DNS names.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the node configuration is invalid.
     pub fn hostnames(&self) -> Result<Vec<String>, ConfigError> {
         self.validate()?;
         let domain = normalize_domain(&self.domain)?;
@@ -125,12 +141,22 @@ pub struct NodeIdentity {
 }
 
 impl NodeIdentity {
+    /// Generates a fresh P-256 node identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cryptographic backend cannot generate a key pair.
     pub fn generate() -> Result<Self, IdentityError> {
         Ok(Self {
             key_pair: KeyPair::generate()?,
         })
     }
 
+    /// Restores a node identity from a PKCS#8 PEM private key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the PEM or private key is invalid or unsupported.
     pub fn from_private_key_pem(pem: &str) -> Result<Self, IdentityError> {
         Ok(Self {
             key_pair: KeyPair::from_pem(pem)?,
@@ -142,12 +168,23 @@ impl NodeIdentity {
         self.key_pair.serialize_pem()
     }
 
+    /// Creates a signed CSR for the supplied DNS names without exposing the private key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a DNS name is invalid or CSR generation fails.
     pub fn csr_pem(&self, hostnames: &[String]) -> Result<String, IdentityError> {
         let params = CertificateParams::new(hostnames.to_vec())?;
         Ok(params.serialize_request(&self.key_pair)?.pem()?)
     }
 }
 
+/// Parses and verifies a CSR and returns its DNS SANs in sorted order.
+///
+/// # Errors
+///
+/// Returns an error when the CSR is malformed, has an invalid signature, or contains an
+/// unsupported certificate request extension.
 pub fn csr_dns_names(csr_pem: &str) -> Result<Vec<String>, IdentityError> {
     let csr = CertificateSigningRequestParams::from_pem(csr_pem)?;
     let mut names = csr
