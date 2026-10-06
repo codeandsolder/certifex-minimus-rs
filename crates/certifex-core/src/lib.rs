@@ -246,7 +246,7 @@ mod tests {
         let identity = NodeIdentity::generate()?;
         let registration = NodeRegistration {
             node_id: "sf314-42".to_owned(),
-            tailscale_ip: "100.118.45.4".parse().expect("static test IP is valid"),
+            tailscale_ip: std::net::IpAddr::from([100, 118, 45, 4]),
             hostnames: vec!["grafana.onhir.eu".to_owned()],
             csr_pem: identity.csr_pem(&csr_names)?,
             installed_generation: None,
