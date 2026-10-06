@@ -237,15 +237,42 @@ fn install_certificate(state_dir: &Path, certificate: &CertificateBundle) -> io:
 fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     use std::io::Write;
 
-    let temporary = path.with_extension("tmp");
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temporary)?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-    fs::rename(temporary, path)
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "state path has no parent directory",
+        )
+    })?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "state path has no UTF-8 filename",
+            )
+        })?;
+    let temporary = parent.join(format!(".{filename}.{:016x}.tmp", fastrand::u64(..)));
+
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
 }
 
 fn detect_tailscale_ip() -> io::Result<IpAddr> {
@@ -296,7 +323,15 @@ fn write_private_key(path: &Path, pem: &str) -> io::Result<()> {
     options.write(true).create_new(true).mode(0o600);
     let mut file = options.open(path)?;
     file.write_all(pem.as_bytes())?;
-    file.sync_all()
+    file.sync_all()?;
+    drop(file);
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private key path has no parent directory",
+        )
+    })?;
+    sync_directory(parent)
 }
 
 #[cfg(not(unix))]
@@ -307,6 +342,21 @@ fn write_private_key(path: &Path, pem: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_write_replaces_state_without_leaving_temp_files() -> io::Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("certifex-node-state-{:016x}", fastrand::u64(..)));
+        fs::create_dir_all(&directory)?;
+        let path = directory.join("certificate-generation");
+
+        atomic_write(&path, b"1")?;
+        atomic_write(&path, b"2")?;
+        assert_eq!(fs::read(&path)?, b"2");
+        assert_eq!(fs::read_dir(&directory)?.count(), 1);
+
+        fs::remove_dir_all(directory)
+    }
 
     #[test]
     fn recognizes_tailscale_ipv4_range() {

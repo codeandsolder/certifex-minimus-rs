@@ -3,7 +3,7 @@ mod cloudflare;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
+    env, io,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
     fs,
+    io::AsyncWriteExt,
     sync::{Mutex, RwLock},
     time::{MissedTickBehavior, interval},
 };
@@ -492,11 +493,46 @@ impl Controller {
     async fn persist_node(&self, node: &StoredNode) -> Result<(), ControllerError> {
         let filename = format!("{}.json", encoded_node_id(&node.registration.node_id));
         let path = self.nodes_dir.join(filename);
-        let temporary = path.with_extension("json.tmp");
-        fs::write(&temporary, serde_json::to_vec_pretty(node)?).await?;
-        fs::rename(temporary, path).await?;
+        durable_replace(&path, &serde_json::to_vec_pretty(node)?).await?;
         Ok(())
     }
+}
+
+async fn durable_replace(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "state path has no parent directory",
+        )
+    })?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "state path has no UTF-8 filename",
+            )
+        })?;
+    let temporary = parent.join(format!(".{filename}.{:016x}.tmp", fastrand::u64(..)));
+
+    let result = async {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await?;
+        file.write_all(contents).await?;
+        file.sync_all().await?;
+        drop(file);
+        fs::rename(&temporary, path).await?;
+        fs::File::open(parent).await?.sync_all().await
+    }
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary).await;
+    }
+    result
 }
 
 fn replacement_chain<'a>(
@@ -566,6 +602,28 @@ mod tests {
             Some("token")
         );
         assert!(normalize_secret(" \n\t", "test").is_err());
+    }
+
+    #[tokio::test]
+    async fn durable_replace_replaces_state_without_leaving_temp_files() -> io::Result<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "certifex-registrar-state-{:016x}",
+            fastrand::u64(..)
+        ));
+        fs::create_dir_all(&directory).await?;
+        let path = directory.join("node.json");
+
+        durable_replace(&path, b"one").await?;
+        durable_replace(&path, b"two").await?;
+        assert_eq!(fs::read(&path).await?, b"two");
+        let mut entries = fs::read_dir(&directory).await?;
+        let mut count = 0;
+        while entries.next_entry().await?.is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 1);
+
+        fs::remove_dir_all(directory).await
     }
 
     #[test]
