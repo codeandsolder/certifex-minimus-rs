@@ -46,6 +46,11 @@ pub struct CertificateBundle {
     pub certificate_chain_pem: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistrationResponse {
+    pub certificate: Option<CertificateBundle>,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RegistrationError {
     #[error("node_id must not be empty")]
