@@ -103,7 +103,7 @@ impl Cloudflare {
     /// Returns an error when Cloudflare cannot list or delete the record.
     pub async fn delete_owned_a(&self, name: &str) -> Result<(), CloudflareError> {
         for record in self.records("A", name).await? {
-            if record.comment.as_deref() == Some(MANAGED_COMMENT) {
+            if is_owned(&record) {
                 self.delete_record(&record.id).await?;
             }
         }
@@ -115,6 +115,12 @@ impl Cloudflare {
     /// # Errors
     /// Returns an error when Cloudflare rejects the record.
     pub async fn create_txt(&self, name: &str, value: &str) -> Result<String, CloudflareError> {
+        for stale in self.records("TXT", name).await? {
+            if is_owned(&stale) {
+                self.delete_record(&stale.id).await?;
+            }
+        }
+
         let request = RecordWrite {
             kind: "TXT",
             name,
@@ -228,6 +234,10 @@ enum AddressAction {
     Patch(String),
 }
 
+fn is_owned(record: &DnsRecord) -> bool {
+    record.comment.as_deref() == Some(MANAGED_COMMENT)
+}
+
 fn address_action(
     name: &str,
     records: &[DnsRecord],
@@ -235,12 +245,10 @@ fn address_action(
 ) -> Result<AddressAction, CloudflareError> {
     match records {
         [] => Ok(AddressAction::Create),
-        [record] if record.comment.as_deref() != Some(MANAGED_COMMENT) => {
-            Err(CloudflareError::UnmanagedAddressRecord {
-                name: name.to_owned(),
-                content: record.content.clone(),
-            })
-        }
+        [record] if !is_owned(record) => Err(CloudflareError::UnmanagedAddressRecord {
+            name: name.to_owned(),
+            content: record.content.clone(),
+        }),
         [record]
             if record.content == desired_content
                 && !record.proxied.unwrap_or(false)
@@ -329,6 +337,24 @@ mod tests {
             ttl,
             comment: comment.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn ownership_requires_exact_certifex_comment() {
+        assert!(is_owned(&record(
+            "id",
+            "challenge",
+            Some(MANAGED_COMMENT),
+            false,
+            60,
+        )));
+        assert!(!is_owned(&record(
+            "id",
+            "challenge",
+            Some("managed by someone else"),
+            false,
+            60,
+        )));
     }
 
     #[test]
