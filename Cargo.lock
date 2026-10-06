@@ -285,15 +285,18 @@ dependencies = [
  "axum",
  "certifex-core",
  "clap",
+ "fastrand",
  "instant-acme",
  "pem",
  "reqwest",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]

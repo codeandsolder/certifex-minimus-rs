@@ -7,10 +7,10 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use acme::{AcmeError, AcmeIssuer};
+use acme::{AcmeError, AcmeIssuer, RenewalSchedule};
 use axum::{
     Json, Router,
     extract::{ConnectInfo, State},
@@ -25,6 +25,7 @@ use thiserror::Error;
 use tokio::{
     fs,
     sync::{Mutex, RwLock},
+    time::{MissedTickBehavior, interval},
 };
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -54,6 +55,9 @@ struct Args {
 
     #[arg(long, default_value_t = 5)]
     dns_propagation_seconds: u64,
+
+    #[arg(long, default_value_t = 3600)]
+    renewal_check_seconds: u64,
 }
 
 #[derive(Clone)]
@@ -74,6 +78,8 @@ struct Controller {
 struct StoredNode {
     registration: NodeRegistration,
     certificate: CertificateBundle,
+    #[serde(default)]
+    renewal: Option<RenewalSchedule>,
 }
 
 #[derive(Debug, Error)]
@@ -117,10 +123,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(args.dns_propagation_seconds),
     )
     .await?;
-    let controller = Controller::load(args.domain, args.state_dir, cloudflare, issuer).await?;
+    let controller =
+        Arc::new(Controller::load(args.domain, args.state_dir, cloudflare, issuer).await?);
     let state = AppState {
-        controller: Arc::new(controller),
+        controller: controller.clone(),
     };
+    let _renewal_task = tokio::spawn(renewal_loop(
+        controller,
+        Duration::from_secs(args.renewal_check_seconds.max(1)),
+    ));
 
     let app = Router::new()
         .route("/healthz", get(health))
@@ -135,6 +146,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     Ok(())
+}
+
+async fn renewal_loop(controller: Arc<Controller>, cadence: Duration) {
+    controller.maintain_renewals().await;
+    let mut ticker = interval(cadence);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        controller.maintain_renewals().await;
+    }
 }
 
 async fn health() -> StatusCode {
@@ -224,27 +246,51 @@ impl Controller {
                 .ensure_a(name, registration.tailscale_ip)
                 .await?;
         }
-        if let Some(previous) = &old {
-            let current = registration.hostnames.iter().collect::<BTreeSet<_>>();
-            for old_name in &previous.registration.hostnames {
-                if !current.contains(old_name) {
-                    self.cloudflare.delete_owned_a(old_name).await?;
+
+        let (certificate, renewal) = match old.as_ref() {
+            Some(previous)
+                if previous.certificate.hostnames == registration.hostnames
+                    && previous.registration.csr_pem == registration.csr_pem =>
+            {
+                let mut renewal = previous.renewal.clone();
+                let now = unix_now();
+                if renewal
+                    .as_ref()
+                    .is_none_or(|schedule| schedule.ari_refresh_due(now))
+                {
+                    renewal = Some(
+                        self.issuer
+                            .renewal_schedule(
+                                &previous.certificate.certificate_chain_pem,
+                                renewal.as_ref(),
+                            )
+                            .await?,
+                    );
+                }
+                if renewal
+                    .as_ref()
+                    .is_some_and(|schedule| schedule.renewal_due(now))
+                {
+                    self.issue_bundle(
+                        &registration,
+                        previous.certificate.generation.saturating_add(1),
+                        Some(&previous.certificate.certificate_chain_pem),
+                    )
+                    .await?
+                } else {
+                    (previous.certificate.clone(), renewal)
                 }
             }
-        }
-
-        let certificate = if let Some(previous) = &old {
-            if previous.certificate.hostnames == registration.hostnames {
-                previous.certificate.clone()
-            } else {
+            Some(previous) => {
+                let replacement = replacement_chain(previous, &registration);
                 self.issue_bundle(
                     &registration,
                     previous.certificate.generation.saturating_add(1),
+                    replacement,
                 )
                 .await?
             }
-        } else {
-            self.issue_bundle(&registration, 1).await?
+            None => self.issue_bundle(&registration, 1, None).await?,
         };
 
         let response_certificate = (registration.installed_generation
@@ -253,6 +299,7 @@ impl Controller {
         let stored = StoredNode {
             registration: registration.clone(),
             certificate,
+            renewal,
         };
         self.persist_node(&stored).await?;
         self.nodes
@@ -260,9 +307,78 @@ impl Controller {
             .await
             .insert(registration.node_id.clone(), stored);
 
+        if let Some(previous) = &old {
+            let current = registration.hostnames.iter().collect::<BTreeSet<_>>();
+            for old_name in &previous.registration.hostnames {
+                if !current.contains(old_name)
+                    && let Err(error) = self.cloudflare.delete_owned_a(old_name).await
+                {
+                    warn!(%old_name, %error, "failed to remove stale managed DNS record");
+                }
+            }
+        }
+
         Ok(RegistrationResponse {
             certificate: response_certificate,
         })
+    }
+
+    async fn maintain_renewals(&self) {
+        let _serial = self.reconcile.lock().await;
+        let node_ids = self.nodes.read().await.keys().cloned().collect::<Vec<_>>();
+        for node_id in node_ids {
+            if let Err(error) = self.maintain_node_renewal(&node_id).await {
+                warn!(%node_id, %error, "certificate renewal maintenance failed");
+            }
+        }
+    }
+
+    async fn maintain_node_renewal(&self, node_id: &str) -> Result<(), ControllerError> {
+        let Some(mut stored) = self.nodes.read().await.get(node_id).cloned() else {
+            return Ok(());
+        };
+        let now = unix_now();
+        let schedule_refreshed = if stored
+            .renewal
+            .as_ref()
+            .is_none_or(|schedule| schedule.ari_refresh_due(now))
+        {
+            stored.renewal = Some(
+                self.issuer
+                    .renewal_schedule(
+                        &stored.certificate.certificate_chain_pem,
+                        stored.renewal.as_ref(),
+                    )
+                    .await?,
+            );
+            true
+        } else {
+            false
+        };
+
+        let renewed = if stored
+            .renewal
+            .as_ref()
+            .is_some_and(|schedule| schedule.renewal_due(now))
+        {
+            let generation = stored.certificate.generation.saturating_add(1);
+            let old_chain = stored.certificate.certificate_chain_pem.clone();
+            let (certificate, renewal) = self
+                .issue_bundle(&stored.registration, generation, Some(&old_chain))
+                .await?;
+            info!(%node_id, generation, "renewed certificate while node may be offline");
+            stored.certificate = certificate;
+            stored.renewal = renewal;
+            true
+        } else {
+            false
+        };
+
+        if schedule_refreshed || renewed {
+            self.persist_node(&stored).await?;
+            self.nodes.write().await.insert(node_id.to_owned(), stored);
+        }
+        Ok(())
     }
 
     async fn validate_registration_scope(
@@ -304,19 +420,31 @@ impl Controller {
         &self,
         registration: &NodeRegistration,
         generation: u64,
-    ) -> Result<CertificateBundle, ControllerError> {
+        replaces_certificate_chain_pem: Option<&str>,
+    ) -> Result<(CertificateBundle, Option<RenewalSchedule>), ControllerError> {
         info!(
             node_id = %registration.node_id,
             names = registration.hostnames.len(),
             generation,
             "issuing certificate"
         );
-        let certificate_chain_pem = self.issuer.issue(registration).await?;
-        Ok(CertificateBundle {
-            generation,
-            hostnames: registration.hostnames.clone(),
-            certificate_chain_pem,
-        })
+        let certificate_chain_pem = self
+            .issuer
+            .issue(registration, replaces_certificate_chain_pem)
+            .await?;
+        let renewal = Some(
+            self.issuer
+                .renewal_schedule(&certificate_chain_pem, None)
+                .await?,
+        );
+        Ok((
+            CertificateBundle {
+                generation,
+                hostnames: registration.hostnames.clone(),
+                certificate_chain_pem,
+            },
+            renewal,
+        ))
     }
 
     async fn persist_node(&self, node: &StoredNode) -> Result<(), ControllerError> {
@@ -327,6 +455,18 @@ impl Controller {
         fs::rename(temporary, path).await?;
         Ok(())
     }
+}
+
+fn replacement_chain<'a>(
+    previous: &'a StoredNode,
+    registration: &NodeRegistration,
+) -> Option<&'a str> {
+    previous
+        .registration
+        .hostnames
+        .iter()
+        .any(|name| registration.hostnames.contains(name))
+        .then_some(previous.certificate.certificate_chain_pem.as_str())
 }
 
 fn encoded_node_id(node_id: &str) -> String {
@@ -350,6 +490,14 @@ fn is_tailscale_ipv4(ip: IpAddr) -> bool {
     };
     let octets = ip.octets();
     octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 #[cfg(test)]

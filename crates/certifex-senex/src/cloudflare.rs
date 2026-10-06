@@ -135,7 +135,7 @@ impl Cloudflare {
     /// # Errors
     /// Returns an error when Cloudflare rejects the deletion.
     pub async fn delete_record(&self, record_id: &str) -> Result<(), CloudflareError> {
-        let path = format!("{}/{}", self.records_path(), record_id);
+        let path = format!("{}/{record_id}", self.records_path());
         let _: DeleteResult = self.delete(&path).await?;
         Ok(())
     }
@@ -156,7 +156,7 @@ impl Cloudflare {
     ) -> Result<T, CloudflareError> {
         let response = self
             .client
-            .get(format!("{}{}", self.api_base, path))
+            .get(format!("{}{path}", self.api_base))
             .bearer_auth(&self.token)
             .query(query)
             .send()
@@ -171,7 +171,7 @@ impl Cloudflare {
     ) -> Result<T, CloudflareError> {
         let response = self
             .client
-            .post(format!("{}{}", self.api_base, path))
+            .post(format!("{}{path}", self.api_base))
             .bearer_auth(&self.token)
             .json(body)
             .send()
@@ -186,7 +186,7 @@ impl Cloudflare {
     ) -> Result<T, CloudflareError> {
         let response = self
             .client
-            .patch(format!("{}{}", self.api_base, path))
+            .patch(format!("{}{path}", self.api_base))
             .bearer_auth(&self.token)
             .json(body)
             .send()
@@ -197,7 +197,7 @@ impl Cloudflare {
     async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T, CloudflareError> {
         let response = self
             .client
-            .delete(format!("{}{}", self.api_base, path))
+            .delete(format!("{}{path}", self.api_base))
             .bearer_auth(&self.token)
             .send()
             .await?;
