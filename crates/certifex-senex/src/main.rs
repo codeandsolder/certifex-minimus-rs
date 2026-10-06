@@ -41,6 +41,9 @@ struct Args {
     #[arg(long)]
     domain: String,
 
+    #[arg(long)]
+    cloudflare_token_file: Option<PathBuf>,
+
     #[arg(long, default_value = "CLOUDFLARE_API_TOKEN")]
     cloudflare_token_env: String,
 
@@ -110,12 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
-    let token = env::var(&args.cloudflare_token_env).map_err(|_| {
-        format!(
-            "Cloudflare token environment variable `{}` is not set",
-            args.cloudflare_token_env
-        )
-    })?;
+    let token = load_cloudflare_token(&args)?;
     let client = reqwest::Client::builder().build()?;
     let cloudflare = Cloudflare::for_zone(client, token, &args.domain).await?;
     let issuer = AcmeIssuer::load_or_create(
@@ -160,6 +158,47 @@ async fn renewal_loop(controller: Arc<Controller>, cadence: Duration) {
         ticker.tick().await;
         controller.maintain_renewals().await;
     }
+}
+
+fn load_cloudflare_token(args: &Args) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(path) = &args.cloudflare_token_file {
+        return Ok(normalize_secret(
+            &std::fs::read_to_string(path)?,
+            &format!("Cloudflare token file `{}`", path.display()),
+        )?);
+    }
+
+    if let Some(credentials_dir) = env::var_os("CREDENTIALS_DIRECTORY") {
+        let path = PathBuf::from(credentials_dir).join("cloudflare-token");
+        if path.is_file() {
+            return Ok(normalize_secret(
+                &std::fs::read_to_string(&path)?,
+                &format!("systemd credential `{}`", path.display()),
+            )?);
+        }
+    }
+
+    let token = env::var(&args.cloudflare_token_env).map_err(|_| {
+        format!(
+            "no Cloudflare token found: pass --cloudflare-token-file, provide systemd credential `cloudflare-token`, or set `{}`",
+            args.cloudflare_token_env
+        )
+    })?;
+    Ok(normalize_secret(
+        &token,
+        &format!("environment variable `{}`", args.cloudflare_token_env),
+    )?)
+}
+
+fn normalize_secret(value: &str, source: &str) -> Result<String, std::io::Error> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{source} is empty"),
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 async fn health() -> StatusCode {
@@ -518,6 +557,15 @@ mod tests {
         assert!(!is_tailscale_ipv4(IpAddr::V4(Ipv4Addr::new(
             100, 128, 0, 1
         ))));
+    }
+
+    #[test]
+    fn trims_and_rejects_empty_secrets() {
+        assert_eq!(
+            normalize_secret("  token\n", "test").ok().as_deref(),
+            Some("token")
+        );
+        assert!(normalize_secret(" \n\t", "test").is_err());
     }
 
     #[test]

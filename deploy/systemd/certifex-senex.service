@@ -1,0 +1,42 @@
+[Unit]
+Description=Certifex registrar and certificate control plane
+Documentation=https://github.com/codeandsolder/certifex-minimus-rs
+Wants=network-online.target
+After=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=certifex-minimus-senex
+StateDirectoryMode=0700
+EnvironmentFile=/etc/certifex-minimus/senex.env
+LoadCredential=cloudflare-token:/etc/certifex-minimus/cloudflare-token
+ExecStart=/usr/local/bin/certifex-senex --domain ${CERTIFEX_DOMAIN} --listen ${CERTIFEX_LISTEN} --state-dir /var/lib/certifex-minimus-senex --acme-directory ${CERTIFEX_ACME_DIRECTORY}
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
