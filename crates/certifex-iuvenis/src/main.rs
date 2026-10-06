@@ -56,15 +56,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder().build()?;
     let proxy = ProxyState::new();
     prepare_proxy(&args, &proxy).await?;
+    let tailscale_ip = detect_tailscale_ip()?;
 
     if args.once {
-        reconcile(&client, &args, &proxy).await?;
+        reconcile(&client, &args, &proxy, tailscale_ip).await?;
         return Ok(());
     }
 
-    let tailscale_ip = detect_tailscale_ip()?;
     let proxy_task = proxy.clone().serve(tailscale_ip, args.https_port);
-    let reconciliation_task = reconciliation_loop(&client, &args, &proxy);
+    let reconciliation_task = reconciliation_loop(&client, &args, &proxy, tailscale_ip);
     tokio::pin!(proxy_task);
     tokio::pin!(reconciliation_task);
 
@@ -78,10 +78,16 @@ async fn reconciliation_loop(
     client: &Client,
     args: &Args,
     proxy: &ProxyState,
+    bound_tailscale_ip: IpAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut baseline = fs::read(&args.config).unwrap_or_default();
     loop {
-        let delay = match reconcile(client, args, proxy).await {
+        if let Ok(current_ip) = detect_tailscale_ip()
+            && current_ip != bound_tailscale_ip
+        {
+            return Err(tailscale_ip_changed(bound_tailscale_ip, current_ip).into());
+        }
+        let delay = match reconcile(client, args, proxy, bound_tailscale_ip).await {
             Ok(config_bytes) => {
                 baseline = config_bytes;
                 Duration::from_secs(args.poll_seconds.saturating_add(fastrand::u64(0..=900)))
@@ -91,7 +97,14 @@ async fn reconciliation_loop(
                 Duration::from_secs(args.retry_seconds.saturating_add(fastrand::u64(0..=15)))
             }
         };
-        wait_for_config_change(&args.config, &baseline, delay, args.config_check_seconds).await;
+        wait_for_reconcile_trigger(
+            &args.config,
+            &baseline,
+            delay,
+            args.config_check_seconds,
+            bound_tailscale_ip,
+        )
+        .await;
     }
 }
 
@@ -116,6 +129,7 @@ async fn reconcile(
     client: &Client,
     args: &Args,
     proxy: &ProxyState,
+    tailscale_ip: IpAddr,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let config_bytes = fs::read(&args.config)?;
     let config: NodeConfig = toml::from_str(std::str::from_utf8(&config_bytes)?)?;
@@ -134,7 +148,7 @@ async fn reconcile(
     };
     let registration = NodeRegistration {
         node_id: config.node_id.clone(),
-        tailscale_ip: detect_tailscale_ip()?,
+        tailscale_ip,
         hostnames,
         csr_pem,
         installed_generation,
@@ -178,11 +192,12 @@ async fn reconcile(
     Ok(config_bytes)
 }
 
-async fn wait_for_config_change(
+async fn wait_for_reconcile_trigger(
     path: &Path,
     baseline: &[u8],
     timeout: Duration,
     check_seconds: u64,
+    bound_tailscale_ip: IpAddr,
 ) {
     let deadline = Instant::now() + timeout;
     let check = Duration::from_secs(check_seconds.max(1));
@@ -196,7 +211,19 @@ async fn wait_for_config_change(
             Ok(current) if current == baseline => {}
             _ => return,
         }
+        if detect_tailscale_ip().is_ok_and(|current_ip| current_ip != bound_tailscale_ip) {
+            return;
+        }
     }
+}
+
+fn tailscale_ip_changed(bound: IpAddr, current: IpAddr) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AddrNotAvailable,
+        format!(
+            "Tailscale IPv4 changed from {bound} to {current}; restart required to rebind HTTPS"
+        ),
+    )
 }
 
 fn load_or_create_identity(path: &Path) -> Result<NodeIdentity, Box<dyn std::error::Error>> {
@@ -356,6 +383,14 @@ mod tests {
         assert_eq!(fs::read_dir(&directory)?.count(), 1);
 
         fs::remove_dir_all(directory)
+    }
+
+    #[test]
+    fn tailscale_ip_change_requests_rebind_restart() {
+        let error =
+            tailscale_ip_changed(IpAddr::from([100, 64, 0, 1]), IpAddr::from([100, 64, 0, 2]));
+        assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+        assert!(error.to_string().contains("restart required"));
     }
 
     #[test]
