@@ -23,6 +23,8 @@ pub enum CertificateError {
     X509(String),
     #[error("leaf certificate SANs differ from the requested names")]
     CertificateNamesMismatch,
+    #[error("leaf certificate contains a non-DNS SAN entry")]
+    NonDnsSan,
     #[error("leaf certificate public key does not match the node private key")]
     PublicKeyMismatch,
     #[error("cannot construct public trust verifier: {0}")]
@@ -68,15 +70,7 @@ pub fn validate_bundle(
         .subject_alternative_name()
         .map_err(|error| CertificateError::X509(error.to_string()))?
         .ok_or(CertificateError::CertificateNamesMismatch)?;
-    let mut certificate_names = san
-        .value
-        .general_names
-        .iter()
-        .filter_map(|name| match name {
-            GeneralName::DNSName(name) => Some((*name).to_owned()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let mut certificate_names = exact_dns_names(&san.value.general_names)?;
     certificate_names.sort_unstable();
     if certificate_names != expected_names {
         return Err(CertificateError::CertificateNamesMismatch);
@@ -104,4 +98,44 @@ pub fn validate_bundle(
     }
 
     Ok(())
+}
+
+fn exact_dns_names(names: &[GeneralName<'_>]) -> Result<Vec<String>, CertificateError> {
+    names
+        .iter()
+        .map(|name| match name {
+            GeneralName::DNSName(name) => Ok((*name).to_owned()),
+            _ => Err(CertificateError::NonDnsSan),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_dns_names_accepts_only_dns_entries() -> Result<(), CertificateError> {
+        let names = [
+            GeneralName::DNSName("one.example"),
+            GeneralName::DNSName("two.example"),
+        ];
+        assert_eq!(
+            exact_dns_names(&names)?,
+            vec!["one.example".to_owned(), "two.example".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_dns_names_rejects_additional_non_dns_entries() {
+        let names = [
+            GeneralName::DNSName("one.example"),
+            GeneralName::URI("spiffe://example/workload"),
+        ];
+        assert!(matches!(
+            exact_dns_names(&names),
+            Err(CertificateError::NonDnsSan)
+        ));
+    }
 }
