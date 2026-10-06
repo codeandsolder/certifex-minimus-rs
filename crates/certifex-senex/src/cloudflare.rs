@@ -17,6 +17,8 @@ pub enum CloudflareError {
     ZoneNotFound(String),
     #[error("multiple A records exist for `{0}`")]
     MultipleAddressRecords(String),
+    #[error("existing A record for `{name}` is not owned by Certifex (content `{content}`)")]
+    UnmanagedAddressRecord { name: String, content: String },
     #[error("only IPv4 Tailscale addresses are supported in v1: {0}")]
     UnsupportedIp(IpAddr),
 }
@@ -67,8 +69,8 @@ impl Cloudflare {
         };
         let content = ip.to_string();
         let records = self.records("A", name).await?;
-        match records.as_slice() {
-            [] => {
+        match address_action(name, &records, &content)? {
+            AddressAction::Create => {
                 let request = RecordWrite {
                     kind: "A",
                     name,
@@ -79,23 +81,18 @@ impl Cloudflare {
                 };
                 let _: DnsRecord = self.post(&self.records_path(), &request).await?;
             }
-            [record] => {
-                if record.content != content
-                    || record.proxied.unwrap_or(false)
-                    || record.comment.as_deref() != Some(MANAGED_COMMENT)
-                {
-                    let request = RecordPatch {
-                        content: &content,
-                        ttl: 1,
-                        proxied: false,
-                        comment: MANAGED_COMMENT,
-                    };
-                    let _: DnsRecord = self
-                        .patch(&format!("{}/{}", self.records_path(), record.id), &request)
-                        .await?;
-                }
+            AddressAction::Keep => {}
+            AddressAction::Patch(record_id) => {
+                let request = RecordPatch {
+                    content: &content,
+                    ttl: 1,
+                    proxied: false,
+                    comment: MANAGED_COMMENT,
+                };
+                let _: DnsRecord = self
+                    .patch(&format!("{}/{record_id}", self.records_path()), &request)
+                    .await?;
             }
-            _ => return Err(CloudflareError::MultipleAddressRecords(name.to_owned())),
         }
         Ok(())
     }
@@ -224,6 +221,38 @@ impl Cloudflare {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AddressAction {
+    Create,
+    Keep,
+    Patch(String),
+}
+
+fn address_action(
+    name: &str,
+    records: &[DnsRecord],
+    desired_content: &str,
+) -> Result<AddressAction, CloudflareError> {
+    match records {
+        [] => Ok(AddressAction::Create),
+        [record] if record.comment.as_deref() != Some(MANAGED_COMMENT) => {
+            Err(CloudflareError::UnmanagedAddressRecord {
+                name: name.to_owned(),
+                content: record.content.clone(),
+            })
+        }
+        [record]
+            if record.content == desired_content
+                && !record.proxied.unwrap_or(false)
+                && record.ttl == 1 =>
+        {
+            Ok(AddressAction::Keep)
+        }
+        [record] => Ok(AddressAction::Patch(record.id.clone())),
+        _ => Err(CloudflareError::MultipleAddressRecords(name.to_owned())),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Zone {
     id: String,
@@ -234,6 +263,7 @@ struct DnsRecord {
     id: String,
     content: String,
     proxied: Option<bool>,
+    ttl: u32,
     comment: Option<String>,
 }
 
@@ -279,4 +309,64 @@ struct Envelope<T> {
 struct ApiError {
     code: i64,
     message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(
+        id: &str,
+        content: &str,
+        comment: Option<&str>,
+        proxied: bool,
+        ttl: u32,
+    ) -> DnsRecord {
+        DnsRecord {
+            id: id.to_owned(),
+            content: content.to_owned(),
+            proxied: Some(proxied),
+            ttl,
+            comment: comment.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn refuses_to_claim_unmanaged_a_record() {
+        let records = [record("id", "100.64.0.5", None, false, 1)];
+        assert!(matches!(
+            address_action("grafana.example.com", &records, "100.64.0.6"),
+            Err(CloudflareError::UnmanagedAddressRecord { .. })
+        ));
+    }
+
+    #[test]
+    fn keeps_exact_owned_a_record() {
+        let records = [record("id", "100.64.0.5", Some(MANAGED_COMMENT), false, 1)];
+        assert_eq!(
+            address_action("grafana.example.com", &records, "100.64.0.5").ok(),
+            Some(AddressAction::Keep)
+        );
+    }
+
+    #[test]
+    fn patches_only_owned_a_record() {
+        let records = [record("id", "100.64.0.5", Some(MANAGED_COMMENT), true, 300)];
+        assert_eq!(
+            address_action("grafana.example.com", &records, "100.64.0.6").ok(),
+            Some(AddressAction::Patch("id".to_owned()))
+        );
+    }
+
+    #[test]
+    fn refuses_ambiguous_a_record_sets() {
+        let records = [
+            record("one", "100.64.0.5", Some(MANAGED_COMMENT), false, 1),
+            record("two", "100.64.0.6", Some(MANAGED_COMMENT), false, 1),
+        ];
+        assert!(matches!(
+            address_action("grafana.example.com", &records, "100.64.0.7"),
+            Err(CloudflareError::MultipleAddressRecords(_))
+        ));
+    }
 }
