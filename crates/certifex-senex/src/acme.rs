@@ -246,8 +246,9 @@ impl AcmeIssuer {
     ) -> Result<RenewalSchedule, AcmeError> {
         let leaf_der = leaf_certificate_der(certificate_chain_pem)?;
         let fallback = fallback_schedule(&leaf_der)?;
-        let certificate_id =
-            CertificateIdentifier::try_from(&leaf_der).map_err(AcmeError::Certificate)?;
+        let Some(certificate_id) = ari_certificate_id(&leaf_der) else {
+            return Ok(fallback);
+        };
         let now = unix_now();
 
         match self.account.renewal_info(&certificate_id).await {
@@ -305,6 +306,16 @@ fn leaf_certificate_der(certificate_chain_pem: &str) -> Result<CertificateDer<'s
     Ok(CertificateDer::from(leaf.into_contents()))
 }
 
+fn ari_certificate_id(leaf_der: &CertificateDer<'_>) -> Option<CertificateIdentifier<'static>> {
+    match CertificateIdentifier::try_from(leaf_der) {
+        Ok(identifier) => Some(identifier.into_owned()),
+        Err(error) => {
+            warn!(%error, "certificate cannot be identified for ACME ARI; using lifetime fallback");
+            None
+        }
+    }
+}
+
 fn fallback_schedule(leaf_der: &CertificateDer<'_>) -> Result<RenewalSchedule, AcmeError> {
     let (_, certificate) = X509Certificate::from_der(leaf_der.as_ref())
         .map_err(|error| AcmeError::Certificate(error.to_string()))?;
@@ -358,12 +369,42 @@ async fn write_secret_json<T: serde::Serialize + Sync>(
     use tokio::io::AsyncWriteExt;
 
     let bytes = serde_json::to_vec_pretty(value)?;
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create_new(true).mode(0o600);
-    let mut file = options.open(path).await?;
-    file.write_all(&bytes).await?;
-    file.sync_all().await?;
-    Ok(())
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "secret path has no parent directory",
+        )
+    })?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "secret path has no UTF-8 filename",
+            )
+        })?;
+    let temporary = parent.join(format!(".{filename}.{:016x}.tmp", fastrand::u64(..)));
+
+    let result = async {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        let mut file = options.open(&temporary).await?;
+        file.write_all(&bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+
+        fs::hard_link(&temporary, path).await?;
+        fs::remove_file(&temporary).await?;
+        tokio::fs::File::open(parent).await?.sync_all().await?;
+        Ok::<(), io::Error>(())
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary).await;
+    }
+    result.map_err(AcmeError::Io)
 }
 
 #[cfg(not(unix))]
@@ -373,4 +414,44 @@ async fn write_secret_json<T: serde::Serialize + Sync>(
 ) -> Result<(), AcmeError> {
     fs::write(path, serde_json::to_vec_pretty(value)?).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rcgen::{CertificateParams, KeyPair};
+
+    use super::*;
+
+    #[test]
+    fn missing_aki_disables_ari_without_disabling_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let key = KeyPair::generate()?;
+        let certificate =
+            CertificateParams::new(vec!["example.invalid".to_owned()])?.self_signed(&key)?;
+        let der = CertificateDer::from(certificate.der().to_vec());
+
+        assert!(ari_certificate_id(&der).is_none());
+        let fallback = fallback_schedule(&der)?;
+        assert!(fallback.renew_after >= unix_now());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn secret_publish_is_atomic_and_does_not_overwrite()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory =
+            std::env::temp_dir().join(format!("certifex-secret-test-{:016x}", fastrand::u64(..)));
+        fs::create_dir_all(&directory).await?;
+        let path = directory.join("account.json");
+
+        write_secret_json(&path, &serde_json::json!({"generation": 1})).await?;
+        let second = write_secret_json(&path, &serde_json::json!({"generation": 2})).await;
+        assert!(second.is_err());
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).await?)?;
+        assert_eq!(stored["generation"], 1);
+
+        fs::remove_dir_all(directory).await?;
+        Ok(())
+    }
 }

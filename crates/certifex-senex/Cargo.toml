@@ -26,3 +26,6 @@ x509-parser = "0.18.1"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
