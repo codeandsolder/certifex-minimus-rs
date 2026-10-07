@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, net::IpAddr};
+use std::{collections::BTreeMap, net::IpAddr, path::PathBuf};
 
 use rcgen::{CertificateParams, CertificateSigningRequestParams, KeyPair, PublicKeyData, SanType};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,30 @@ pub struct NodeConfig {
     pub domain: String,
     pub registrar: String,
     pub services: BTreeMap<String, u16>,
+    #[serde(default)]
+    pub fanouts: BTreeMap<String, FanoutConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FanoutConfig {
+    #[serde(default)]
+    pub files: Vec<FileRoute>,
+    #[serde(default)]
+    pub tcp_ranges: Vec<TcpRangeRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRoute {
+    pub path: String,
+    pub source: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpRangeRoute {
+    pub path_prefix: String,
+    pub first: u16,
+    pub last: u16,
+    pub port_base: u16,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -22,8 +46,18 @@ pub enum ConfigError {
     EmptyNodeId,
     #[error("node_id exceeds {MAX_NODE_ID_BYTES} bytes")]
     NodeIdTooLong,
-    #[error("node config contains more than {MAX_HOSTNAMES} services")]
+    #[error("node config contains more than {MAX_HOSTNAMES} hostnames")]
     TooManyServices,
+    #[error("service and fanout both claim label `{0}`")]
+    DuplicateLabel(String),
+    #[error("fanout `{0}` has no routes")]
+    EmptyFanout(String),
+    #[error("invalid fanout path `{0}`")]
+    InvalidPath(String),
+    #[error("fanout file source must be absolute: `{0}`")]
+    RelativeFile(String),
+    #[error("invalid TCP range in fanout `{0}`")]
+    InvalidTcpRange(String),
     #[error("domain must not be empty")]
     EmptyDomain,
     #[error("invalid DNS label `{0}`")]
@@ -141,7 +175,7 @@ impl NodeConfig {
         if self.node_id.len() > MAX_NODE_ID_BYTES {
             return Err(ConfigError::NodeIdTooLong);
         }
-        if self.services.len() > MAX_HOSTNAMES {
+        if self.services.len().saturating_add(self.fanouts.len()) > MAX_HOSTNAMES {
             return Err(ConfigError::TooManyServices);
         }
 
@@ -152,6 +186,48 @@ impl NodeConfig {
             validate_label(label)?;
             if *port == 0 {
                 return Err(ConfigError::ZeroPort(label.clone()));
+            }
+            if self.fanouts.contains_key(label) {
+                return Err(ConfigError::DuplicateLabel(label.clone()));
+            }
+        }
+        for (label, fanout) in &self.fanouts {
+            validate_label(label)?;
+            if fanout.files.is_empty() && fanout.tcp_ranges.is_empty() {
+                return Err(ConfigError::EmptyFanout(label.clone()));
+            }
+            for (index, route) in fanout.files.iter().enumerate() {
+                validate_path(&route.path)?;
+                if !route.source.is_absolute() {
+                    return Err(ConfigError::RelativeFile(
+                        route.source.display().to_string(),
+                    ));
+                }
+                if fanout.files[index + 1..]
+                    .iter()
+                    .any(|other| other.path == route.path)
+                {
+                    return Err(ConfigError::InvalidPath(route.path.clone()));
+                }
+            }
+            for range in &fanout.tcp_ranges {
+                validate_path_prefix(&range.path_prefix)?;
+                let first_port = range.port_base.checked_add(range.first);
+                let last_port = range.port_base.checked_add(range.last);
+                if range.first > range.last
+                    || first_port.is_none_or(|port| port == 0)
+                    || last_port.is_none_or(|port| port == 0)
+                {
+                    return Err(ConfigError::InvalidTcpRange(label.clone()));
+                }
+            }
+            for (index, left) in fanout.tcp_ranges.iter().enumerate() {
+                for right in &fanout.tcp_ranges[index + 1..] {
+                    let overlaps = !(left.last < right.first || right.last < left.first);
+                    if left.path_prefix == right.path_prefix && overlaps {
+                        return Err(ConfigError::InvalidTcpRange(label.clone()));
+                    }
+                }
             }
         }
 
@@ -166,11 +242,40 @@ impl NodeConfig {
     pub fn hostnames(&self) -> Result<Vec<String>, ConfigError> {
         self.validate()?;
         let domain = normalize_domain(&self.domain)?;
-        Ok(self
+        let mut hostnames = self
             .services
             .keys()
+            .chain(self.fanouts.keys())
             .map(|label| format!("{label}.{domain}"))
-            .collect())
+            .collect::<Vec<_>>();
+        hostnames.sort_unstable();
+        Ok(hostnames)
+    }
+
+    /// Returns the normalized base domain after validating the complete node configuration.
+    ///
+    /// # Errors
+    /// Returns an error when the node configuration is invalid.
+    pub fn canonical_domain(&self) -> Result<String, ConfigError> {
+        self.validate()?;
+        normalize_domain(&self.domain)
+    }
+}
+
+fn validate_path(path: &str) -> Result<(), ConfigError> {
+    if path.starts_with('/') && !path.contains(['?', '#']) {
+        Ok(())
+    } else {
+        Err(ConfigError::InvalidPath(path.to_owned()))
+    }
+}
+
+fn validate_path_prefix(prefix: &str) -> Result<(), ConfigError> {
+    validate_path(prefix)?;
+    if prefix.ends_with('/') {
+        Ok(())
+    } else {
+        Err(ConfigError::InvalidPath(prefix.to_owned()))
     }
 }
 
@@ -287,6 +392,7 @@ mod tests {
             domain: "Onhir.EU.".to_owned(),
             registrar: "https://certifex.onhir.eu".to_owned(),
             services: BTreeMap::from([("grafana".to_owned(), 3000), ("victoria".to_owned(), 8428)]),
+            fanouts: BTreeMap::new(),
         }
     }
 
@@ -426,5 +532,53 @@ mod tests {
             Err(RegistrationError::CsrNameMismatch)
         );
         Ok(())
+    }
+    #[test]
+    fn fanout_hostname_and_routes_validate() -> Result<(), ConfigError> {
+        let mut config = config();
+        config.fanouts.insert(
+            "workers".to_owned(),
+            FanoutConfig {
+                files: vec![FileRoute {
+                    path: "/inventory.json".to_owned(),
+                    source: PathBuf::from("/run/example/inventory.json"),
+                }],
+                tcp_ranges: vec![TcpRangeRoute {
+                    path_prefix: "/".to_owned(),
+                    first: 1,
+                    last: 30,
+                    port_base: 17_400,
+                }],
+            },
+        );
+        assert!(config.hostnames()?.contains(&"workers.onhir.eu".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn fanout_rejects_overflow_and_label_collision() {
+        let mut config = config();
+        config.fanouts.insert(
+            "grafana".to_owned(),
+            FanoutConfig {
+                files: Vec::new(),
+                tcp_ranges: vec![TcpRangeRoute {
+                    path_prefix: "/".to_owned(),
+                    first: 1,
+                    last: 30,
+                    port_base: u16::MAX - 10,
+                }],
+            },
+        );
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::DuplicateLabel("grafana".to_owned()))
+        );
+
+        config.services.remove("grafana");
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::InvalidTcpRange("grafana".to_owned()))
+        );
     }
 }

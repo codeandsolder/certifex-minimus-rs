@@ -89,7 +89,7 @@ struct StoredNode {
 
 #[derive(Debug, Error)]
 enum ControllerError {
-    #[error("hostname `{0}` is not a direct child of the configured domain")]
+    #[error("hostname `{0}` is not below the configured domain")]
     OutsideDomain(String),
     #[error("hostname `{name}` is already owned by node `{node_id}`")]
     NameCollision { name: String, node_id: String },
@@ -437,12 +437,8 @@ impl Controller {
                 registration.tailscale_ip,
             ));
         }
-        let suffix = format!(".{}", self.domain);
         for name in &registration.hostnames {
-            let Some(prefix) = name.strip_suffix(&suffix) else {
-                return Err(ControllerError::OutsideDomain(name.clone()));
-            };
-            if prefix.is_empty() || prefix.contains('.') {
+            if !is_domain_descendant(name, &self.domain) {
                 return Err(ControllerError::OutsideDomain(name.clone()));
             }
         }
@@ -566,6 +562,11 @@ fn encoded_node_id(node_id: &str) -> String {
     result
 }
 
+fn is_domain_descendant(name: &str, domain: &str) -> bool {
+    name.strip_suffix(domain)
+        .is_some_and(|prefix| !prefix.is_empty() && prefix.ends_with('.'))
+}
+
 fn is_tailscale_ipv4(ip: IpAddr) -> bool {
     let IpAddr::V4(ip) = ip else {
         return false;
@@ -634,5 +635,13 @@ mod tests {
     fn encodes_node_ids_without_path_separators() {
         assert_eq!(encoded_node_id("foo/bar"), "foo%2Fbar");
         assert_eq!(encoded_node_id("sf314-42"), "sf314-42");
+    }
+    #[test]
+    fn accepts_descendants_but_not_apex_or_lookalikes() {
+        assert!(is_domain_descendant("grafana.onhir.eu", "onhir.eu"));
+        assert!(is_domain_descendant("exits.waw.onhir.eu", "onhir.eu"));
+        assert!(!is_domain_descendant("onhir.eu", "onhir.eu"));
+        assert!(!is_domain_descendant("evilonhir.eu", "onhir.eu"));
+        assert!(!is_domain_descendant("onhir.eu.example", "onhir.eu"));
     }
 }
