@@ -46,6 +46,9 @@ struct Args {
     #[arg(long)]
     cloudflare_token_file: Option<PathBuf>,
 
+    #[arg(long)]
+    cloudflare_token_json_file: Option<PathBuf>,
+
     #[arg(long, default_value = "CLOUDFLARE_API_TOKEN")]
     cloudflare_token_env: String,
 
@@ -172,11 +175,25 @@ fn load_cloudflare_token(args: &Args) -> Result<String, Box<dyn std::error::Erro
             &format!("Cloudflare token file `{}`", path.display()),
         )?);
     }
+    if let Some(path) = &args.cloudflare_token_json_file {
+        return Ok(parse_cloudflare_token_json(
+            &std::fs::read_to_string(path)?,
+            &format!("Cloudflare token JSON file `{}`", path.display()),
+        )?);
+    }
 
     if let Some(credentials_dir) = env::var_os("CREDENTIALS_DIRECTORY") {
-        let path = PathBuf::from(credentials_dir).join("cloudflare-token");
+        let credentials_dir = PathBuf::from(credentials_dir);
+        let path = credentials_dir.join("cloudflare-token");
         if path.is_file() {
             return Ok(normalize_secret(
+                &std::fs::read_to_string(&path)?,
+                &format!("systemd credential `{}`", path.display()),
+            )?);
+        }
+        let path = credentials_dir.join("cloudflare-token-json");
+        if path.is_file() {
+            return Ok(parse_cloudflare_token_json(
                 &std::fs::read_to_string(&path)?,
                 &format!("systemd credential `{}`", path.display()),
             )?);
@@ -185,7 +202,7 @@ fn load_cloudflare_token(args: &Args) -> Result<String, Box<dyn std::error::Erro
 
     let token = env::var(&args.cloudflare_token_env).map_err(|_| {
         format!(
-            "no Cloudflare token found: pass --cloudflare-token-file, provide systemd credential `cloudflare-token`, or set `{}`",
+            "no Cloudflare token found: pass --cloudflare-token-file/--cloudflare-token-json-file, provide systemd credential `cloudflare-token`/`cloudflare-token-json`, or set `{}`",
             args.cloudflare_token_env
         )
     })?;
@@ -193,6 +210,25 @@ fn load_cloudflare_token(args: &Args) -> Result<String, Box<dyn std::error::Erro
         &token,
         &format!("environment variable `{}`", args.cloudflare_token_env),
     )?)
+}
+
+fn parse_cloudflare_token_json(value: &str, source: &str) -> Result<String, std::io::Error> {
+    let document: serde_json::Value = serde_json::from_str(value).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{source} is not valid JSON: {error}"),
+        )
+    })?;
+    let token = document
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{source} does not contain a string `value` field"),
+            )
+        })?;
+    normalize_secret(token, source)
 }
 
 fn normalize_secret(value: &str, source: &str) -> Result<String, std::io::Error> {
@@ -643,5 +679,16 @@ mod tests {
         assert!(!is_domain_descendant("onhir.eu", "onhir.eu"));
         assert!(!is_domain_descendant("evilonhir.eu", "onhir.eu"));
         assert!(!is_domain_descendant("onhir.eu.example", "onhir.eu"));
+    }
+    #[test]
+    fn parses_cloudflare_cli_token_json() {
+        assert_eq!(
+            parse_cloudflare_token_json(r#"{"id":"abc","value":"token-value"}"#, "test")
+                .ok()
+                .as_deref(),
+            Some("token-value")
+        );
+        assert!(parse_cloudflare_token_json(r#"{"id":"abc"}"#, "test").is_err());
+        assert!(parse_cloudflare_token_json("not-json", "test").is_err());
     }
 }
