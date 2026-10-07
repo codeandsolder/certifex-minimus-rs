@@ -248,7 +248,6 @@ dependencies = [
  "pem",
  "reqwest",
  "rustls",
- "serde_json",
  "thiserror",
  "tokio",
  "tokio-rustls",
