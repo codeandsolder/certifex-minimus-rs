@@ -42,7 +42,7 @@ If persisted certificate state is corrupt or no longer matches the private key, 
 
 - owns the Cloudflare DNS credential and the ACME account, not node private keys;
 - accepts only Tailscale IPv4 claims and rejects a remote registration whose TCP source address differs from the claimed address;
-- only permits direct child names of the configured base domain;
+- only permits names below the configured base domain;
 - keeps hostname ownership stable across restarts and rejects collisions between nodes;
 - reconciles unproxied Cloudflare `A` records to the node Tailscale address and removes names a node relinquishes;
 - completes ACME DNS-01 challenges in parallel, then removes challenge TXT records;
@@ -66,6 +66,26 @@ victoria = 8428
 This requests one certificate whose SAN set is exactly `grafana.example.com` and `victoria.example.com`, then routes those names to `127.0.0.1:3000` and `127.0.0.1:8428` respectively.
 
 Service labels are intentionally one DNS label deep. Wildcards and arbitrary nested names are out of scope for v1.
+
+### Path fan-out services
+
+A node can also publish one hostname that selects among multiple local TCP backends by URL path. This is useful for replica banks, test workers, sharded local services, or any other node-local set where creating one DNS name per backend would be needless.
+
+```toml
+[fanouts.workers]
+
+[[fanouts.workers.files]]
+path = "/inventory.json"
+source = "/run/workers/inventory.json"
+
+[[fanouts.workers.tcp_ranges]]
+path_prefix = "/"
+first = 1
+last = 16
+port_base = 9000
+```
+
+The example requests `workers.example.com`. `GET /inventory.json` and `HEAD /inventory.json` serve the current file directly with `Cache-Control: no-store`. An HTTP/1.1 `CONNECT /7` opens `127.0.0.1:9007`; after the `200 OK` response the connection is a raw bidirectional TCP tunnel. File routes take precedence over TCP ranges. Backends remain loopback-only by design.
 
 ## Registrar startup
 

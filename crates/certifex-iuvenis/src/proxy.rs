@@ -5,17 +5,19 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::Path,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use bytes::Bytes;
-use certifex_core::{ConfigError, NodeConfig};
+use certifex_core::{ConfigError, FanoutConfig, NodeConfig, TcpRangeRoute};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::{
-    Request, Response, StatusCode, Uri, Version,
+    Method, Request, Response, StatusCode, Uri, Version,
     body::Incoming,
     header::{
-        CONNECTION, HOST, HeaderName, HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE,
-        TRAILER, TRANSFER_ENCODING, UPGRADE,
+        ALLOW, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName,
+        HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING,
+        UPGRADE,
     },
     service::service_fn,
 };
@@ -29,7 +31,12 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
 use thiserror::Error;
-use tokio::{net::TcpListener, sync::RwLock as AsyncRwLock};
+use tokio::{
+    fs,
+    net::{TcpListener, TcpStream},
+    sync::RwLock as AsyncRwLock,
+    time::timeout,
+};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
@@ -38,10 +45,17 @@ const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host")
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ProxyBody = BoxBody<Bytes, BoxError>;
 type BackendClient = Client<HttpConnector, Incoming>;
+
+#[derive(Clone)]
+enum Route {
+    Http(u16),
+    Fanout(FanoutConfig),
+}
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -64,7 +78,7 @@ pub enum ProxyError {
 #[derive(Clone)]
 pub struct ProxyState {
     tls: Arc<RwLock<Option<Arc<ServerConfig>>>>,
-    routes: Arc<AsyncRwLock<BTreeMap<String, u16>>>,
+    routes: Arc<AsyncRwLock<BTreeMap<String, Route>>>,
 }
 
 impl ProxyState {
@@ -81,11 +95,14 @@ impl ProxyState {
     /// # Errors
     /// Returns an error if the node configuration is invalid.
     pub async fn set_routes(&self, config: &NodeConfig) -> Result<(), ProxyError> {
-        let hostnames = config.hostnames()?;
-        let routes = hostnames
-            .into_iter()
-            .zip(config.services.values().copied())
-            .collect();
+        let domain = config.canonical_domain()?;
+        let mut routes = BTreeMap::new();
+        for (label, port) in &config.services {
+            routes.insert(format!("{label}.{domain}"), Route::Http(*port));
+        }
+        for (label, fanout) in &config.fanouts {
+            routes.insert(format!("{label}.{domain}"), Route::Fanout(fanout.clone()));
+        }
         *self.routes.write().await = routes;
         Ok(())
     }
@@ -198,9 +215,9 @@ impl ProxyState {
 }
 
 async fn proxy_request(
-    mut request: Request<Incoming>,
+    request: Request<Incoming>,
     peer: SocketAddr,
-    routes: Arc<AsyncRwLock<BTreeMap<String, u16>>>,
+    routes: Arc<AsyncRwLock<BTreeMap<String, Route>>>,
     client: BackendClient,
 ) -> Result<Response<ProxyBody>, Infallible> {
     let Some(authority) = request_authority(&request) else {
@@ -210,17 +227,33 @@ async fn proxy_request(
         ));
     };
     let host = normalize_host(&authority);
-    let port = {
+    let route = {
         let routes = routes.read().await;
-        routes.get(&host).copied()
+        routes.get(&host).cloned()
     };
-    let Some(port) = port else {
+    let Some(route) = route else {
         return Ok(text_response(
             StatusCode::NOT_FOUND,
             "unknown Certifex service\n",
         ));
     };
 
+    match route {
+        Route::Http(port) => {
+            Ok(proxy_http_request(request, peer, client, authority, host, port).await)
+        }
+        Route::Fanout(fanout) => Ok(fanout_request(request, host, fanout).await),
+    }
+}
+
+async fn proxy_http_request(
+    mut request: Request<Incoming>,
+    peer: SocketAddr,
+    client: BackendClient,
+    authority: String,
+    host: String,
+    port: u16,
+) -> Response<ProxyBody> {
     let frontend_upgrade = is_upgrade_request(&request).then(|| hyper::upgrade::on(&mut request));
     let path = request
         .uri()
@@ -230,10 +263,7 @@ async fn proxy_request(
         Ok(uri) => uri,
         Err(error) => {
             warn!(%host, port, %error, "failed to construct backend URI");
-            return Ok(text_response(
-                StatusCode::BAD_GATEWAY,
-                "invalid backend URI\n",
-            ));
+            return text_response(StatusCode::BAD_GATEWAY, "invalid backend URI\n");
         }
     };
     *request.uri_mut() = uri;
@@ -259,19 +289,143 @@ async fn proxy_request(
             let status = response.status();
             sanitize_response_hop_by_hop(response.headers_mut(), status);
             let (parts, body) = response.into_parts();
-            Ok(Response::from_parts(
+            Response::from_parts(
                 parts,
                 body.map_err(|error| -> BoxError { Box::new(error) })
                     .boxed(),
-            ))
+            )
         }
         Err(error) => {
             warn!(%host, port, %error, "backend request failed");
-            Ok(text_response(
-                StatusCode::BAD_GATEWAY,
-                "backend unavailable\n",
-            ))
+            text_response(StatusCode::BAD_GATEWAY, "backend unavailable\n")
         }
+    }
+}
+
+async fn fanout_request(
+    mut request: Request<Incoming>,
+    host: String,
+    fanout: FanoutConfig,
+) -> Response<ProxyBody> {
+    let path = request.uri().path();
+    if let Some(route) = fanout.files.iter().find(|route| route.path == path) {
+        return file_response(request.method(), route.source.as_path(), &host, path).await;
+    }
+
+    if request.method() != Method::CONNECT {
+        return text_response(StatusCode::NOT_FOUND, "unknown fanout route\n");
+    }
+    if request.version() != Version::HTTP_11 {
+        return text_response(
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+            "TCP fanout requires HTTP/1.1 CONNECT\n",
+        );
+    }
+    let Some(port) = tcp_port_for_path(&fanout, path) else {
+        return text_response(StatusCode::NOT_FOUND, "unknown fanout route\n");
+    };
+    let backend = match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(("127.0.0.1", port))).await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
+            warn!(%host, port, %error, "fanout TCP backend unavailable");
+            return text_response(StatusCode::BAD_GATEWAY, "backend unavailable\n");
+        }
+        Err(_) => {
+            warn!(%host, port, "fanout TCP backend connect timed out");
+            return text_response(StatusCode::GATEWAY_TIMEOUT, "backend connect timed out\n");
+        }
+    };
+
+    let frontend = hyper::upgrade::on(&mut request);
+    tokio::spawn(tunnel_connect(frontend, backend, host, port));
+    empty_response(StatusCode::OK)
+}
+
+async fn file_response(
+    method: &Method,
+    source: &Path,
+    host: &str,
+    route_path: &str,
+) -> Response<ProxyBody> {
+    if method != Method::GET && method != Method::HEAD {
+        let mut response = text_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n");
+        response
+            .headers_mut()
+            .insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
+        return response;
+    }
+
+    let contents = match fs::read(source).await {
+        Ok(contents) => contents,
+        Err(error) => {
+            warn!(%host, path = %route_path, source = %source.display(), %error, "fanout file unavailable");
+            return text_response(StatusCode::BAD_GATEWAY, "file unavailable\n");
+        }
+    };
+    let content_length = contents.len();
+    let body = if method == Method::HEAD {
+        Bytes::new()
+    } else {
+        Bytes::from(contents)
+    };
+    let mut response = bytes_response(StatusCode::OK, body);
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if source
+        .extension()
+        .is_some_and(|extension| extension == "json")
+    {
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    }
+    if let Ok(value) = HeaderValue::from_str(&content_length.to_string()) {
+        response.headers_mut().insert(CONTENT_LENGTH, value);
+    }
+    response
+}
+
+fn tcp_port_for_path(fanout: &FanoutConfig, path: &str) -> Option<u16> {
+    fanout
+        .tcp_ranges
+        .iter()
+        .filter_map(|range| {
+            tcp_range_match(range, path).map(|port| (range.path_prefix.len(), port))
+        })
+        .max_by_key(|(prefix_len, _)| *prefix_len)
+        .map(|(_, port)| port)
+}
+
+fn tcp_range_match(range: &TcpRangeRoute, path: &str) -> Option<u16> {
+    let suffix = path.strip_prefix(&range.path_prefix)?;
+    if suffix.is_empty() || suffix.contains('/') {
+        return None;
+    }
+    let index = suffix.parse::<u16>().ok()?;
+    if !(range.first..=range.last).contains(&index) {
+        return None;
+    }
+    range.port_base.checked_add(index)
+}
+
+async fn tunnel_connect(
+    frontend: hyper::upgrade::OnUpgrade,
+    mut backend: TcpStream,
+    host: String,
+    port: u16,
+) {
+    let frontend = match frontend.await {
+        Ok(frontend) => frontend,
+        Err(error) => {
+            debug!(%host, port, %error, "CONNECT upgrade failed");
+            return;
+        }
+    };
+    let mut frontend = TokioIo::new(frontend);
+    if let Err(error) = tokio::io::copy_bidirectional(&mut frontend, &mut backend).await {
+        debug!(%host, port, %error, "fanout TCP tunnel ended with error");
     }
 }
 
@@ -374,13 +528,21 @@ fn set_forwarded_headers(headers: &mut hyper::HeaderMap, host: &str, peer_ip: Ip
     }
 }
 
-fn text_response(status: StatusCode, body: &'static str) -> Response<ProxyBody> {
-    let body = Full::new(Bytes::from_static(body.as_bytes()))
+fn bytes_response(status: StatusCode, body: Bytes) -> Response<ProxyBody> {
+    let body = Full::new(body)
         .map_err(|never| -> BoxError { match never {} })
         .boxed();
     let mut response = Response::new(body);
     *response.status_mut() = status;
     response
+}
+
+fn empty_response(status: StatusCode) -> Response<ProxyBody> {
+    bytes_response(status, Bytes::new())
+}
+
+fn text_response(status: StatusCode, body: &'static str) -> Response<ProxyBody> {
+    bytes_response(status, Bytes::from_static(body.as_bytes()))
 }
 
 #[cfg(test)]
@@ -431,5 +593,22 @@ mod tests {
             Some(&HeaderValue::from_static("websocket"))
         );
         assert!(!headers.contains_key(KEEP_ALIVE));
+    }
+    #[test]
+    fn maps_numeric_fanout_paths_to_ports() {
+        let fanout = FanoutConfig {
+            files: Vec::new(),
+            tcp_ranges: vec![TcpRangeRoute {
+                path_prefix: "/".to_owned(),
+                first: 1,
+                last: 30,
+                port_base: 17_400,
+            }],
+        };
+        assert_eq!(tcp_port_for_path(&fanout, "/1"), Some(17_401));
+        assert_eq!(tcp_port_for_path(&fanout, "/30"), Some(17_430));
+        assert_eq!(tcp_port_for_path(&fanout, "/0"), None);
+        assert_eq!(tcp_port_for_path(&fanout, "/31"), None);
+        assert_eq!(tcp_port_for_path(&fanout, "/1/extra"), None);
     }
 }
