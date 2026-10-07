@@ -1,6 +1,9 @@
 use std::{collections::BTreeMap, net::IpAddr, path::PathBuf};
 
-use rcgen::{CertificateParams, CertificateSigningRequestParams, KeyPair, PublicKeyData, SanType};
+use rcgen::{
+    CertificateParams, CertificateSigningRequestParams, DistinguishedName, KeyPair, PublicKeyData,
+    SanType,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -323,7 +326,8 @@ impl NodeIdentity {
     ///
     /// Returns an error when a DNS name is invalid or CSR generation fails.
     pub fn csr_pem(&self, hostnames: &[String]) -> Result<String, IdentityError> {
-        let params = CertificateParams::new(hostnames.to_vec())?;
+        let mut params = CertificateParams::new(hostnames.to_vec())?;
+        params.distinguished_name = DistinguishedName::new();
         Ok(params.serialize_request(&self.key_pair)?.pem()?)
     }
 }
@@ -429,6 +433,8 @@ mod tests {
 
         assert_eq!(csr_dns_names(&first)?, names);
         assert_eq!(csr_dns_names(&second)?, names);
+        let parsed = CertificateSigningRequestParams::from_pem(&first)?;
+        assert_eq!(parsed.params.distinguished_name.iter().count(), 0);
         Ok(())
     }
 
