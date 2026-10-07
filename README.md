@@ -82,10 +82,10 @@ source = "/run/workers/inventory.json"
 path_prefix = "/"
 first = 1
 last = 16
-port_base = 9000
+port_start = 9000
 ```
 
-The example requests `workers.example.com`. `GET /inventory.json` and `HEAD /inventory.json` serve the current file directly with `Cache-Control: no-store`. An HTTP/1.1 `CONNECT /7` opens `127.0.0.1:9007`; after the `200 OK` response the connection is a raw bidirectional TCP tunnel. File routes take precedence over TCP ranges. Backends remain loopback-only by design.
+The example requests `workers.example.com`; `port_start` is the backend port selected by `first`. `GET /inventory.json` and `HEAD /inventory.json` serve the current file directly with `Cache-Control: no-store`. An HTTP/1.1 `CONNECT /7` opens `127.0.0.1:9006`; after the `200 OK` response the connection is a raw bidirectional TCP tunnel. File routes take precedence over TCP ranges. Backends remain loopback-only by design.
 
 ## Registrar startup
 
