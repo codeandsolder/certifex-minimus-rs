@@ -37,7 +37,7 @@ pub struct TcpRangeRoute {
     pub path_prefix: String,
     pub first: u16,
     pub last: u16,
-    pub port_base: u16,
+    pub port_start: u16,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -212,10 +212,10 @@ impl NodeConfig {
             }
             for range in &fanout.tcp_ranges {
                 validate_path_prefix(&range.path_prefix)?;
-                let first_port = range.port_base.checked_add(range.first);
-                let last_port = range.port_base.checked_add(range.last);
+                let span = range.last.checked_sub(range.first);
+                let last_port = span.and_then(|span| range.port_start.checked_add(span));
                 if range.first > range.last
-                    || first_port.is_none_or(|port| port == 0)
+                    || range.port_start == 0
                     || last_port.is_none_or(|port| port == 0)
                 {
                     return Err(ConfigError::InvalidTcpRange(label.clone()));
@@ -547,7 +547,7 @@ mod tests {
                     path_prefix: "/".to_owned(),
                     first: 1,
                     last: 30,
-                    port_base: 17_400,
+                    port_start: 17_400,
                 }],
             },
         );
@@ -566,7 +566,7 @@ mod tests {
                     path_prefix: "/".to_owned(),
                     first: 1,
                     last: 30,
-                    port_base: u16::MAX - 10,
+                    port_start: u16::MAX - 10,
                 }],
             },
         );

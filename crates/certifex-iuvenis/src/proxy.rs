@@ -407,7 +407,9 @@ fn tcp_range_match(range: &TcpRangeRoute, path: &str) -> Option<u16> {
     if !(range.first..=range.last).contains(&index) {
         return None;
     }
-    range.port_base.checked_add(index)
+    range
+        .port_start
+        .checked_add(index.checked_sub(range.first)?)
 }
 
 async fn tunnel_connect(
@@ -602,11 +604,11 @@ mod tests {
                 path_prefix: "/".to_owned(),
                 first: 1,
                 last: 30,
-                port_base: 17_400,
+                port_start: 17_400,
             }],
         };
-        assert_eq!(tcp_port_for_path(&fanout, "/1"), Some(17_401));
-        assert_eq!(tcp_port_for_path(&fanout, "/30"), Some(17_430));
+        assert_eq!(tcp_port_for_path(&fanout, "/1"), Some(17_400));
+        assert_eq!(tcp_port_for_path(&fanout, "/30"), Some(17_429));
         assert_eq!(tcp_port_for_path(&fanout, "/0"), None);
         assert_eq!(tcp_port_for_path(&fanout, "/31"), None);
         assert_eq!(tcp_port_for_path(&fanout, "/1/extra"), None);
