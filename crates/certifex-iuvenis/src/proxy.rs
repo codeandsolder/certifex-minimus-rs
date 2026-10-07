@@ -9,7 +9,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use certifex_core::{ConfigError, FanoutConfig, NodeConfig, TcpRangeRoute};
+use certifex_core::{ConfigError, FanoutConfig, NodeConfig, TcpInventoryRoute, TcpRangeRoute};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, StatusCode, Uri, Version,
@@ -46,6 +46,7 @@ const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_INVENTORY_BYTES: u64 = 1024 * 1024;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ProxyBody = BoxBody<Bytes, BoxError>;
@@ -321,8 +322,13 @@ async fn fanout_request(
             "TCP fanout requires HTTP/1.1 CONNECT\n",
         );
     }
-    let Some(port) = tcp_port_for_path(&fanout, path) else {
-        return text_response(StatusCode::NOT_FOUND, "unknown fanout route\n");
+    let port = match tcp_port_for_path(&fanout, path).await {
+        Ok(Some(port)) => port,
+        Ok(None) => return text_response(StatusCode::NOT_FOUND, "unknown fanout route\n"),
+        Err(error) => {
+            warn!(%host, path, %error, "fanout inventory lookup failed");
+            return text_response(StatusCode::BAD_GATEWAY, "inventory unavailable\n");
+        }
     };
     let backend = match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(("127.0.0.1", port))).await
     {
@@ -387,15 +393,101 @@ async fn file_response(
     response
 }
 
-fn tcp_port_for_path(fanout: &FanoutConfig, path: &str) -> Option<u16> {
-    fanout
+async fn tcp_port_for_path(fanout: &FanoutConfig, path: &str) -> Result<Option<u16>, String> {
+    let static_match = fanout
         .tcp_ranges
         .iter()
         .filter_map(|range| {
             tcp_range_match(range, path).map(|port| (range.path_prefix.len(), port))
         })
-        .max_by_key(|(prefix_len, _)| *prefix_len)
-        .map(|(_, port)| port)
+        .max_by_key(|(prefix_len, _)| *prefix_len);
+    let inventory_match = inventory_route_for_path(&fanout.tcp_inventories, path);
+    match (static_match, inventory_match) {
+        (Some((static_len, _port)), Some((inventory_len, route, index)))
+            if inventory_len > static_len =>
+        {
+            inventory_port(route, index).await
+        }
+        (Some((_, port)), _) => Ok(Some(port)),
+        (None, Some((_, route, index))) => inventory_port(route, index).await,
+        (None, None) => Ok(None),
+    }
+}
+
+fn inventory_route_for_path<'a>(
+    routes: &'a [TcpInventoryRoute],
+    path: &str,
+) -> Option<(usize, &'a TcpInventoryRoute, usize)> {
+    routes
+        .iter()
+        .filter_map(|route| {
+            let suffix = path.strip_prefix(&route.path_prefix)?;
+            if suffix.is_empty() || suffix.contains('/') {
+                return None;
+            }
+            let index = suffix.parse::<u16>().ok()?;
+            if !(route.first..=route.last).contains(&index) {
+                return None;
+            }
+            Some((
+                route.path_prefix.len(),
+                route,
+                usize::from(index - route.first),
+            ))
+        })
+        .max_by_key(|(prefix_len, _, _)| *prefix_len)
+}
+
+async fn inventory_port(route: &TcpInventoryRoute, index: usize) -> Result<Option<u16>, String> {
+    let metadata = fs::metadata(&route.source)
+        .await
+        .map_err(|error| format!("failed to stat {}: {error}", route.source.display()))?;
+    if metadata.len() > MAX_INVENTORY_BYTES {
+        return Err(format!(
+            "inventory {} exceeds {MAX_INVENTORY_BYTES} bytes",
+            route.source.display()
+        ));
+    }
+    let bytes = fs::read(&route.source)
+        .await
+        .map_err(|error| format!("failed to read {}: {error}", route.source.display()))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid JSON in {}: {error}", route.source.display()))?;
+    let items = value
+        .pointer(&route.items_pointer)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("items pointer {:?} is not an array", route.items_pointer))?;
+    let Some(item) = items.get(index) else {
+        return Ok(None);
+    };
+    let endpoint = item
+        .pointer(&route.endpoint_pointer)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            format!(
+                "endpoint pointer {:?} is not a string",
+                route.endpoint_pointer
+            )
+        })?;
+    loopback_port_from_uri(endpoint).map(Some)
+}
+
+fn loopback_port_from_uri(endpoint: &str) -> Result<u16, String> {
+    let url =
+        reqwest::Url::parse(endpoint).map_err(|error| format!("invalid endpoint URI: {error}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "endpoint URI has no host".to_owned())?;
+    let address = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| "inventory endpoint host must be an IP address".to_owned())?;
+    if !address.is_loopback() {
+        return Err("inventory endpoint must use an IP loopback address".to_owned());
+    }
+    url.port()
+        .ok_or_else(|| "inventory endpoint must include an explicit port".to_owned())
 }
 
 fn tcp_range_match(range: &TcpRangeRoute, path: &str) -> Option<u16> {
@@ -596,8 +688,8 @@ mod tests {
         );
         assert!(!headers.contains_key(KEEP_ALIVE));
     }
-    #[test]
-    fn maps_numeric_fanout_paths_to_ports() {
+    #[tokio::test]
+    async fn maps_numeric_fanout_paths_to_ports() {
         let fanout = FanoutConfig {
             files: Vec::new(),
             tcp_ranges: vec![TcpRangeRoute {
@@ -606,11 +698,55 @@ mod tests {
                 last: 30,
                 port_start: 17_400,
             }],
+            tcp_inventories: Vec::new(),
         };
-        assert_eq!(tcp_port_for_path(&fanout, "/1"), Some(17_400));
-        assert_eq!(tcp_port_for_path(&fanout, "/30"), Some(17_429));
-        assert_eq!(tcp_port_for_path(&fanout, "/0"), None);
-        assert_eq!(tcp_port_for_path(&fanout, "/31"), None);
-        assert_eq!(tcp_port_for_path(&fanout, "/1/extra"), None);
+        assert_eq!(tcp_port_for_path(&fanout, "/1").await, Ok(Some(17_400)));
+        assert_eq!(tcp_port_for_path(&fanout, "/30").await, Ok(Some(17_429)));
+        assert_eq!(tcp_port_for_path(&fanout, "/0").await, Ok(None));
+        assert_eq!(tcp_port_for_path(&fanout, "/31").await, Ok(None));
+        assert_eq!(tcp_port_for_path(&fanout, "/1/extra").await, Ok(None));
+    }
+    #[tokio::test]
+    async fn inventory_fanout_is_dense_and_missing_entries_are_absent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = std::env::temp_dir().join(format!(
+            "certifex-inventory-{}-{}.json",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        fs::write(
+            &source,
+            br#"{"workers":[{"endpoint":"socks5h://127.0.0.1:17400"},{"endpoint":"tcp://127.0.0.1:18404"}]}"#,
+        )
+        .await?;
+        let fanout = FanoutConfig {
+            files: Vec::new(),
+            tcp_ranges: Vec::new(),
+            tcp_inventories: vec![TcpInventoryRoute {
+                path_prefix: "/".to_owned(),
+                first: 1,
+                last: 30,
+                source: source.clone(),
+                items_pointer: "/workers".to_owned(),
+                endpoint_pointer: "/endpoint".to_owned(),
+            }],
+        };
+        assert_eq!(tcp_port_for_path(&fanout, "/1").await, Ok(Some(17_400)));
+        assert_eq!(tcp_port_for_path(&fanout, "/2").await, Ok(Some(18_404)));
+        assert_eq!(tcp_port_for_path(&fanout, "/3").await, Ok(None));
+        fs::remove_file(source).await?;
+        Ok(())
+    }
+
+    #[test]
+    fn inventory_endpoint_requires_explicit_loopback_ip() {
+        assert_eq!(
+            loopback_port_from_uri("socks5h://127.0.0.1:17400"),
+            Ok(17_400)
+        );
+        assert_eq!(loopback_port_from_uri("tcp://[::1]:9000"), Ok(9_000));
+        assert!(loopback_port_from_uri("tcp://localhost:9000").is_err());
+        assert!(loopback_port_from_uri("tcp://192.0.2.1:9000").is_err());
+        assert!(loopback_port_from_uri("tcp://127.0.0.1").is_err());
     }
 }
