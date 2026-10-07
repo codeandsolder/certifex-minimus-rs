@@ -27,6 +27,8 @@ pub struct FanoutConfig {
     pub files: Vec<FileRoute>,
     #[serde(default)]
     pub tcp_ranges: Vec<TcpRangeRoute>,
+    #[serde(default)]
+    pub tcp_inventories: Vec<TcpInventoryRoute>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +43,16 @@ pub struct TcpRangeRoute {
     pub first: u16,
     pub last: u16,
     pub port_start: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpInventoryRoute {
+    pub path_prefix: String,
+    pub first: u16,
+    pub last: u16,
+    pub source: PathBuf,
+    pub items_pointer: String,
+    pub endpoint_pointer: String,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -61,6 +73,8 @@ pub enum ConfigError {
     RelativeFile(String),
     #[error("invalid TCP range in fanout `{0}`")]
     InvalidTcpRange(String),
+    #[error("invalid TCP inventory in fanout `{0}`")]
+    InvalidTcpInventory(String),
     #[error("domain must not be empty")]
     EmptyDomain,
     #[error("invalid DNS label `{0}`")]
@@ -196,7 +210,10 @@ impl NodeConfig {
         }
         for (label, fanout) in &self.fanouts {
             validate_label(label)?;
-            if fanout.files.is_empty() && fanout.tcp_ranges.is_empty() {
+            if fanout.files.is_empty()
+                && fanout.tcp_ranges.is_empty()
+                && fanout.tcp_inventories.is_empty()
+            {
                 return Err(ConfigError::EmptyFanout(label.clone()));
             }
             for (index, route) in fanout.files.iter().enumerate() {
@@ -229,6 +246,40 @@ impl NodeConfig {
                     let overlaps = !(left.last < right.first || right.last < left.first);
                     if left.path_prefix == right.path_prefix && overlaps {
                         return Err(ConfigError::InvalidTcpRange(label.clone()));
+                    }
+                }
+            }
+            for (index, route) in fanout.tcp_inventories.iter().enumerate() {
+                validate_path_prefix(&route.path_prefix)?;
+                if route.first > route.last
+                    || !route.source.is_absolute()
+                    || !valid_json_pointer(&route.items_pointer)
+                    || !valid_json_pointer(&route.endpoint_pointer)
+                {
+                    return Err(ConfigError::InvalidTcpInventory(label.clone()));
+                }
+                for other in &fanout.tcp_inventories[index + 1..] {
+                    if same_numeric_route(
+                        route.path_prefix.as_str(),
+                        route.first,
+                        route.last,
+                        other.path_prefix.as_str(),
+                        other.first,
+                        other.last,
+                    ) {
+                        return Err(ConfigError::InvalidTcpInventory(label.clone()));
+                    }
+                }
+                for range in &fanout.tcp_ranges {
+                    if same_numeric_route(
+                        route.path_prefix.as_str(),
+                        route.first,
+                        route.last,
+                        range.path_prefix.as_str(),
+                        range.first,
+                        range.last,
+                    ) {
+                        return Err(ConfigError::InvalidTcpInventory(label.clone()));
                     }
                 }
             }
@@ -271,6 +322,21 @@ fn validate_path(path: &str) -> Result<(), ConfigError> {
     } else {
         Err(ConfigError::InvalidPath(path.to_owned()))
     }
+}
+
+fn valid_json_pointer(pointer: &str) -> bool {
+    pointer.is_empty() || pointer.starts_with('/')
+}
+
+fn same_numeric_route(
+    left_prefix: &str,
+    left_first: u16,
+    left_last: u16,
+    right_prefix: &str,
+    right_first: u16,
+    right_last: u16,
+) -> bool {
+    left_prefix == right_prefix && !(left_last < right_first || right_last < left_first)
 }
 
 fn validate_path_prefix(prefix: &str) -> Result<(), ConfigError> {
@@ -555,6 +621,7 @@ mod tests {
                     last: 30,
                     port_start: 17_400,
                 }],
+                tcp_inventories: Vec::new(),
             },
         );
         assert!(config.hostnames()?.contains(&"workers.onhir.eu".to_owned()));
@@ -574,6 +641,7 @@ mod tests {
                     last: 30,
                     port_start: u16::MAX - 10,
                 }],
+                tcp_inventories: Vec::new(),
             },
         );
         assert_eq!(
@@ -586,5 +654,25 @@ mod tests {
             config.validate(),
             Err(ConfigError::InvalidTcpRange("grafana".to_owned()))
         );
+    }
+    #[test]
+    fn inventory_fanout_validates_absolute_source_and_json_pointers() -> Result<(), ConfigError> {
+        let mut config = config();
+        config.fanouts.insert(
+            "workers".to_owned(),
+            FanoutConfig {
+                files: Vec::new(),
+                tcp_ranges: Vec::new(),
+                tcp_inventories: vec![TcpInventoryRoute {
+                    path_prefix: "/".to_owned(),
+                    first: 1,
+                    last: 30,
+                    source: PathBuf::from("/run/workers/inventory.json"),
+                    items_pointer: "/workers".to_owned(),
+                    endpoint_pointer: "/endpoint".to_owned(),
+                }],
+            },
+        );
+        config.validate()
     }
 }

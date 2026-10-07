@@ -87,6 +87,20 @@ port_start = 9000
 
 The example requests `workers.example.com`; `port_start` is the backend port selected by `first`. `GET /inventory.json` and `HEAD /inventory.json` serve the current file directly with `Cache-Control: no-store`. An HTTP/1.1 `CONNECT /7` opens `127.0.0.1:9006`; after the `200 OK` response the connection is a raw bidirectional TCP tunnel. File routes take precedence over TCP ranges. Backends remain loopback-only by design.
 
+For a live set whose physical ports are sparse or change over time, a fanout can instead derive numbered CONNECT routes from a JSON inventory:
+
+```toml
+[[fanouts.workers.tcp_inventories]]
+path_prefix = "/"
+first = 1
+last = 30
+source = "/run/workers/inventory.json"
+items_pointer = "/workers"
+endpoint_pointer = "/endpoint"
+```
+
+`CONNECT /1` selects array entry 0, `/2` entry 1, and so on. The endpoint field must be an absolute URI with an explicit IP loopback host and port; its scheme is metadata and the tunnel itself remains raw TCP. The inventory is read on each CONNECT, so membership changes do not require a Certifex reload.
+
 ## Registrar startup
 
 ACME defaults to Let's Encrypt **staging** on purpose.
