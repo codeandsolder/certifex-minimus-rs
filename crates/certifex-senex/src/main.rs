@@ -354,6 +354,27 @@ impl Controller {
         self.validate_registration_scope(&registration).await?;
 
         let old = self.nodes.read().await.get(&registration.node_id).cloned();
+        if registration.hostnames.is_empty() {
+            if let Some(previous) = &old {
+                for old_name in &previous.registration.hostnames {
+                    self.cloudflare.delete_owned_a(old_name).await?;
+                }
+                let filename = format!("{}.json", encoded_node_id(&registration.node_id));
+                let path = self.nodes_dir.join(filename);
+                match fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                self.nodes.write().await.remove(&registration.node_id);
+                info!(
+                    node_id = %registration.node_id,
+                    "node relinquished its final managed hostname"
+                );
+            }
+            return Ok(RegistrationResponse { certificate: None });
+        }
+
         for name in &registration.hostnames {
             self.cloudflare
                 .ensure_a(name, registration.tailscale_ip)

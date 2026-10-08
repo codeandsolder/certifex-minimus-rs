@@ -104,8 +104,6 @@ pub enum RegistrationError {
     EmptyNodeId,
     #[error("node_id exceeds {MAX_NODE_ID_BYTES} bytes")]
     NodeIdTooLong,
-    #[error("registration contains no hostnames")]
-    EmptyHostnames,
     #[error("registration contains more than {MAX_HOSTNAMES} hostnames")]
     TooManyHostnames,
     #[error("invalid or non-canonical hostname `{0}`")]
@@ -133,9 +131,6 @@ impl NodeRegistration {
         }
         if self.node_id.len() > MAX_NODE_ID_BYTES {
             return Err(RegistrationError::NodeIdTooLong);
-        }
-        if self.hostnames.is_empty() {
-            return Err(RegistrationError::EmptyHostnames);
         }
         if self.hostnames.len() > MAX_HOSTNAMES {
             return Err(RegistrationError::TooManyHostnames);
