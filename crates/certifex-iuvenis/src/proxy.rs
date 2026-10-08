@@ -44,6 +44,7 @@ use tracing::{debug, info, warn};
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
+const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -556,7 +557,8 @@ fn set_forwarded_headers(headers: &mut hyper::HeaderMap, host: &str, peer_ip: Ip
     }
     headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static("https"));
     if let Ok(value) = HeaderValue::from_str(&peer_ip.to_string()) {
-        headers.insert(X_FORWARDED_FOR, value);
+        headers.insert(X_FORWARDED_FOR, value.clone());
+        headers.insert(X_REAL_IP, value);
     }
 }
 
