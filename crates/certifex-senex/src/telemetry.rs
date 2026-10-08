@@ -99,17 +99,18 @@ fn increment(counter: Option<&Counter>, what: &str) {
     }
 }
 
-fn metric_u64(value: u64) -> f64 {
-    f64::from(u32::try_from(value).unwrap_or(u32::MAX))
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the metrics backend stores samples as f64; retaining the full f64 integer range is preferable to clamping at u32::MAX"
+)]
+const fn metric_u64(value: u64) -> f64 {
+    value as f64
 }
 
-fn metric_i64(value: i64) -> f64 {
-    let bounded = i32::try_from(value).unwrap_or_else(|_| {
-        if value.is_negative() {
-            i32::MIN
-        } else {
-            i32::MAX
-        }
-    });
-    f64::from(bounded)
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Unix timestamps are metrics samples; f64 exactly represents all practical timestamp values"
+)]
+const fn metric_i64(value: i64) -> f64 {
+    value as f64
 }

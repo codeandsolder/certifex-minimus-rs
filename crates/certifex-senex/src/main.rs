@@ -18,7 +18,10 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use certifex_core::{CertificateBundle, NodeRegistration, RegistrationResponse};
+use certifex_core::{
+    CertificateBundle, IdentityError, NodeRegistration, RegistrationResponse,
+    csr_public_key_spki_der,
+};
 use clap::Parser;
 use cloudflare::{Cloudflare, CloudflareError};
 use serde::{Deserialize, Serialize};
@@ -110,6 +113,10 @@ enum ControllerError {
     NameCollision { name: String, node_id: String },
     #[error("claimed address is not a Tailscale IPv4 address: {0}")]
     InvalidTailscaleIp(IpAddr),
+    #[error("node_id `{0}` is already bound to a different node key")]
+    NodeKeyMismatch(String),
+    #[error("stored node identity is invalid: {0}")]
+    Identity(#[from] IdentityError),
     #[error("Cloudflare error: {0}")]
     Cloudflare(#[from] CloudflareError),
     #[error("ACME error: {0}")]
@@ -301,7 +308,8 @@ async fn register(
         Err(
             error @ (ControllerError::OutsideDomain(_)
             | ControllerError::NameCollision { .. }
-            | ControllerError::InvalidTailscaleIp(_)),
+            | ControllerError::InvalidTailscaleIp(_)
+            | ControllerError::NodeKeyMismatch(_)),
         ) => {
             state.controller.telemetry.registration_failed();
             warn!(%node_id, %error, "rejected registration");
@@ -355,33 +363,96 @@ impl Controller {
 
         let old = self.nodes.read().await.get(&registration.node_id).cloned();
         if registration.hostnames.is_empty() {
-            if let Some(previous) = &old {
-                for old_name in &previous.registration.hostnames {
-                    self.cloudflare.delete_owned_a(old_name).await?;
-                }
-                let filename = format!("{}.json", encoded_node_id(&registration.node_id));
-                let path = self.nodes_dir.join(filename);
-                match fs::remove_file(&path).await {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
-                self.nodes.write().await.remove(&registration.node_id);
-                info!(
-                    node_id = %registration.node_id,
-                    "node relinquished its final managed hostname"
-                );
-            }
-            return Ok(RegistrationResponse { certificate: None });
+            return self.deregister_node(&registration, old.as_ref()).await;
         }
 
+        self.reconcile_dns(&registration, old.as_ref()).await?;
+        let (certificate, renewal) = self
+            .certificate_for_registration(&registration, old.as_ref())
+            .await?;
+        let response_certificate = (registration.installed_generation
+            != Some(certificate.generation))
+        .then(|| certificate.clone());
+        let stored = StoredNode {
+            registration: registration.clone(),
+            certificate,
+            renewal,
+        };
+        self.persist_node(&stored).await?;
+        self.nodes
+            .write()
+            .await
+            .insert(registration.node_id.clone(), stored.clone());
+        self.telemetry.node_state(
+            &registration.node_id,
+            stored.certificate.generation,
+            stored.renewal.as_ref().map(|schedule| schedule.renew_after),
+            stored
+                .renewal
+                .as_ref()
+                .and_then(|schedule| schedule.ari_check_after),
+        );
+
+        Ok(RegistrationResponse {
+            certificate: response_certificate,
+        })
+    }
+
+    async fn deregister_node(
+        &self,
+        registration: &NodeRegistration,
+        previous: Option<&StoredNode>,
+    ) -> Result<RegistrationResponse, ControllerError> {
+        if let Some(previous) = previous {
+            for old_name in &previous.registration.hostnames {
+                self.cloudflare.delete_owned_a(old_name).await?;
+            }
+            let tombstone = StoredNode {
+                registration: registration.clone(),
+                certificate: previous.certificate.clone(),
+                renewal: None,
+            };
+            self.persist_node(&tombstone).await?;
+            self.nodes
+                .write()
+                .await
+                .insert(registration.node_id.clone(), tombstone);
+            info!(
+                node_id = %registration.node_id,
+                generation = previous.certificate.generation,
+                "node relinquished its final managed hostname"
+            );
+        }
+        Ok(RegistrationResponse { certificate: None })
+    }
+
+    async fn reconcile_dns(
+        &self,
+        registration: &NodeRegistration,
+        previous: Option<&StoredNode>,
+    ) -> Result<(), ControllerError> {
         for name in &registration.hostnames {
             self.cloudflare
                 .ensure_a(name, registration.tailscale_ip)
                 .await?;
         }
+        if let Some(previous) = previous {
+            let current = registration.hostnames.iter().collect::<BTreeSet<_>>();
+            for old_name in &previous.registration.hostnames {
+                if !current.contains(old_name) {
+                    self.cloudflare.delete_owned_a(old_name).await?;
+                }
+            }
+        }
+        Ok(())
+    }
 
-        let (certificate, renewal) = match old.as_ref() {
+    async fn certificate_for_registration(
+        &self,
+        registration: &NodeRegistration,
+        previous: Option<&StoredNode>,
+    ) -> Result<(CertificateBundle, Option<RenewalSchedule>), ControllerError> {
+        match previous {
             Some(previous)
                 if previous.certificate.hostnames == registration.hostnames
                     && previous.registration.csr_pem == registration.csr_pem =>
@@ -406,64 +477,26 @@ impl Controller {
                     .is_some_and(|schedule| schedule.renewal_due(now))
                 {
                     self.issue_bundle(
-                        &registration,
+                        registration,
                         previous.certificate.generation.saturating_add(1),
                         Some(&previous.certificate.certificate_chain_pem),
                     )
-                    .await?
+                    .await
                 } else {
-                    (previous.certificate.clone(), renewal)
+                    Ok((previous.certificate.clone(), renewal))
                 }
             }
             Some(previous) => {
-                let replacement = replacement_chain(previous, &registration);
+                let replacement = replacement_chain(previous, registration);
                 self.issue_bundle(
-                    &registration,
+                    registration,
                     previous.certificate.generation.saturating_add(1),
                     replacement,
                 )
-                .await?
+                .await
             }
-            None => self.issue_bundle(&registration, 1, None).await?,
-        };
-
-        let response_certificate = (registration.installed_generation
-            != Some(certificate.generation))
-        .then(|| certificate.clone());
-        let stored = StoredNode {
-            registration: registration.clone(),
-            certificate,
-            renewal,
-        };
-        self.persist_node(&stored).await?;
-        self.nodes
-            .write()
-            .await
-            .insert(registration.node_id.clone(), stored.clone());
-        self.telemetry.node_state(
-            &registration.node_id,
-            stored.certificate.generation,
-            stored.renewal.as_ref().map(|schedule| schedule.renew_after),
-            stored
-                .renewal
-                .as_ref()
-                .and_then(|schedule| schedule.ari_check_after),
-        );
-
-        if let Some(previous) = &old {
-            let current = registration.hostnames.iter().collect::<BTreeSet<_>>();
-            for old_name in &previous.registration.hostnames {
-                if !current.contains(old_name)
-                    && let Err(error) = self.cloudflare.delete_owned_a(old_name).await
-                {
-                    warn!(%old_name, %error, "failed to remove stale managed DNS record");
-                }
-            }
+            None => self.issue_bundle(registration, 1, None).await,
         }
-
-        Ok(RegistrationResponse {
-            certificate: response_certificate,
-        })
     }
 
     async fn maintain_renewals(&self) {
@@ -481,6 +514,9 @@ impl Controller {
         let Some(mut stored) = self.nodes.read().await.get(node_id).cloned() else {
             return Ok(());
         };
+        if stored.registration.hostnames.is_empty() {
+            return Ok(());
+        }
         let now = unix_now();
         let schedule_refreshed = if stored
             .renewal
@@ -549,7 +585,15 @@ impl Controller {
             }
         }
 
-        for (other_id, other) in self.nodes.read().await.iter() {
+        let nodes = self.nodes.read().await;
+        if let Some(previous) = nodes.get(&registration.node_id)
+            && !registration_identity_allowed(&previous.registration, registration)?
+        {
+            return Err(ControllerError::NodeKeyMismatch(
+                registration.node_id.clone(),
+            ));
+        }
+        for (other_id, other) in nodes.iter() {
             if other_id == &registration.node_id {
                 continue;
             }
@@ -562,6 +606,7 @@ impl Controller {
                 }
             }
         }
+        drop(nodes);
         Ok(())
     }
 
@@ -642,6 +687,17 @@ async fn durable_replace(path: &std::path::Path, contents: &[u8]) -> io::Result<
     result
 }
 
+fn registration_identity_allowed(
+    previous: &NodeRegistration,
+    registration: &NodeRegistration,
+) -> Result<bool, IdentityError> {
+    if previous.hostnames.is_empty() {
+        return Ok(true);
+    }
+    Ok(csr_public_key_spki_der(&previous.csr_pem)?
+        == csr_public_key_spki_der(&registration.csr_pem)?)
+}
+
 fn replacement_chain<'a>(
     previous: &'a StoredNode,
     registration: &NodeRegistration,
@@ -694,7 +750,34 @@ fn unix_now() -> i64 {
 mod tests {
     use std::net::Ipv4Addr;
 
+    use certifex_core::NodeIdentity;
+
     use super::*;
+
+    #[test]
+    fn node_key_continuity_is_required_until_relinquished() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let identity = NodeIdentity::generate()?;
+        let replacement_identity = NodeIdentity::generate()?;
+        let registration = |csr_pem| NodeRegistration {
+            node_id: "node".to_owned(),
+            tailscale_ip: IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+            hostnames: vec!["one.example.com".to_owned()],
+            csr_pem,
+            installed_generation: None,
+        };
+        let previous = registration(identity.csr_pem(&["one.example.com".to_owned()])?);
+        let same_key = registration(identity.csr_pem(&["two.example.com".to_owned()])?);
+        let new_key = registration(replacement_identity.csr_pem(&["one.example.com".to_owned()])?);
+
+        assert!(registration_identity_allowed(&previous, &same_key)?);
+        assert!(!registration_identity_allowed(&previous, &new_key)?);
+
+        let mut relinquished = previous;
+        relinquished.hostnames.clear();
+        assert!(registration_identity_allowed(&relinquished, &new_key)?);
+        Ok(())
+    }
 
     #[test]
     fn recognizes_tailscale_range() {

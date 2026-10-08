@@ -67,6 +67,8 @@ pub enum ConfigError {
     InvalidLabel(String),
     #[error("service `{0}` uses port 0")]
     ZeroPort(String),
+    #[error("hostname for service or fanout `{0}` exceeds 253 bytes")]
+    HostnameTooLong(String),
 }
 
 #[derive(Debug, Error)]
@@ -182,6 +184,7 @@ impl NodeConfig {
 
         for (label, port) in &self.services {
             validate_label(label)?;
+            validate_hostname_length(label, &domain)?;
             if *port == 0 {
                 return Err(ConfigError::ZeroPort(label.clone()));
             }
@@ -191,6 +194,7 @@ impl NodeConfig {
         }
         for (label, fanout) in &self.fanouts {
             validate_label(label)?;
+            validate_hostname_length(label, &domain)?;
             if fanout.files.is_empty() && fanout.tcp_ranges.is_empty() {
                 return Err(ConfigError::EmptyFanout(label.clone()));
             }
@@ -257,6 +261,14 @@ impl NodeConfig {
     pub fn canonical_domain(&self) -> Result<String, ConfigError> {
         self.validate()?;
         normalize_domain(&self.domain)
+    }
+}
+
+fn validate_hostname_length(label: &str, domain: &str) -> Result<(), ConfigError> {
+    if label.len() + 1 + domain.len() <= 253 {
+        Ok(())
+    } else {
+        Err(ConfigError::HostnameTooLong(label.to_owned()))
     }
 }
 
@@ -348,6 +360,15 @@ pub fn csr_dns_names(csr_pem: &str) -> Result<Vec<String>, IdentityError> {
     Ok(names)
 }
 
+/// Parses and verifies a CSR and returns its DER-encoded `SubjectPublicKeyInfo`.
+///
+/// # Errors
+/// Returns an error when the CSR is malformed or has an invalid signature.
+pub fn csr_public_key_spki_der(csr_pem: &str) -> Result<Vec<u8>, IdentityError> {
+    let csr = CertificateSigningRequestParams::from_pem(csr_pem)?;
+    Ok(csr.public_key.subject_public_key_info())
+}
+
 fn normalize_domain(domain: &str) -> Result<String, ConfigError> {
     let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
     if domain.is_empty() {
@@ -428,6 +449,10 @@ mod tests {
 
         assert_eq!(csr_dns_names(&first)?, names);
         assert_eq!(csr_dns_names(&second)?, names);
+        assert_eq!(
+            csr_public_key_spki_der(&first)?,
+            csr_public_key_spki_der(&second)?
+        );
         let parsed = CertificateSigningRequestParams::from_pem(&first)?;
         assert_eq!(parsed.params.distinguished_name.iter().count(), 0);
         Ok(())
@@ -514,6 +539,19 @@ mod tests {
             uppercase.validate(),
             Err(ConfigError::InvalidLabel("Grafana".to_owned()))
         );
+
+        let mut hostname_too_long = config();
+        hostname_too_long.domain = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61),
+        ]
+        .join(".");
+        assert_eq!(
+            hostname_too_long.validate(),
+            Err(ConfigError::HostnameTooLong("grafana".to_owned()))
+        );
     }
 
     #[test]
@@ -534,6 +572,22 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn empty_registration_is_a_valid_deregistration() -> Result<(), Box<dyn std::error::Error>> {
+        let identity = NodeIdentity::generate()?;
+        let registration = NodeRegistration {
+            node_id: "sf314-42".to_owned(),
+            tailscale_ip: std::net::IpAddr::from([100, 118, 45, 4]),
+            hostnames: Vec::new(),
+            csr_pem: identity.csr_pem(&[])?,
+            installed_generation: Some(17),
+        };
+
+        registration.validate()?;
+        Ok(())
+    }
+
     #[test]
     fn fanout_hostname_and_routes_validate() -> Result<(), ConfigError> {
         let mut config = config();

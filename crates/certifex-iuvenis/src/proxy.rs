@@ -41,6 +41,7 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
+const FORWARDED: HeaderName = HeaderName::from_static("forwarded");
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
@@ -220,6 +221,17 @@ impl ProxyState {
     /// Returns an error if the TLS state lock is poisoned.
     pub fn has_tls(&self) -> Result<bool, ProxyError> {
         Ok(self.current_tls_config()?.is_some())
+    }
+
+    /// Stops serving the currently installed certificate for future handshakes.
+    ///
+    /// Existing TLS connections retain the configuration they already cloned.
+    ///
+    /// # Errors
+    /// Returns an error if the TLS state lock is poisoned.
+    pub fn clear_tls(&self) -> Result<(), ProxyError> {
+        *self.tls.write().map_err(|_| ProxyError::PoisonedTlsLock)? = None;
+        Ok(())
     }
 
     fn current_tls_config(&self) -> Result<Option<Arc<ServerConfig>>, ProxyError> {
@@ -552,6 +564,7 @@ fn sanitize_response_hop_by_hop(headers: &mut hyper::HeaderMap, status: StatusCo
 }
 
 fn set_forwarded_headers(headers: &mut hyper::HeaderMap, host: &str, peer_ip: IpAddr) {
+    headers.remove(FORWARDED);
     if let Ok(value) = HeaderValue::from_str(host) {
         headers.insert(X_FORWARDED_HOST, value);
     }
@@ -628,6 +641,30 @@ mod tests {
         );
         assert!(!headers.contains_key(KEEP_ALIVE));
     }
+    #[test]
+    fn overwrites_client_supplied_forwarding_identity() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(FORWARDED, HeaderValue::from_static("for=203.0.113.10"));
+        headers.insert(X_FORWARDED_FOR, HeaderValue::from_static("203.0.113.10"));
+        headers.insert(X_REAL_IP, HeaderValue::from_static("203.0.113.10"));
+
+        set_forwarded_headers(
+            &mut headers,
+            "grafana.example.com",
+            IpAddr::from([100, 64, 0, 7]),
+        );
+
+        assert!(!headers.contains_key(FORWARDED));
+        assert_eq!(
+            headers.get(X_FORWARDED_FOR),
+            Some(&HeaderValue::from_static("100.64.0.7"))
+        );
+        assert_eq!(
+            headers.get(X_REAL_IP),
+            Some(&HeaderValue::from_static("100.64.0.7"))
+        );
+    }
+
     #[test]
     fn maps_numeric_fanout_paths_to_ports() {
         let fanout = FanoutConfig {
