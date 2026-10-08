@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use crate::telemetry::Telemetry;
 use bytes::Bytes;
 use certifex_core::{ConfigError, FanoutConfig, NodeConfig, TcpRangeRoute};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
@@ -79,15 +80,22 @@ pub enum ProxyError {
 pub struct ProxyState {
     tls: Arc<RwLock<Option<Arc<ServerConfig>>>>,
     routes: Arc<AsyncRwLock<BTreeMap<String, Route>>>,
+    telemetry: Telemetry,
 }
 
 impl ProxyState {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(telemetry: Telemetry) -> Self {
         Self {
             tls: Arc::new(RwLock::new(None)),
             routes: Arc::new(AsyncRwLock::new(BTreeMap::new())),
+            telemetry,
         }
+    }
+
+    #[must_use]
+    pub const fn telemetry(&self) -> &Telemetry {
+        &self.telemetry
     }
 
     /// Replaces the hostname routing table from the current node configuration.
@@ -175,17 +183,25 @@ impl ProxyState {
             };
             let routes = self.routes.clone();
             let client = client.clone();
+            let telemetry = self.telemetry.clone();
             tokio::spawn(async move {
                 let acceptor = TlsAcceptor::from(tls_config);
                 let tls = match acceptor.accept(stream).await {
                     Ok(tls) => tls,
                     Err(error) => {
+                        telemetry.tls_handshake_failed();
                         debug!(%peer, %error, "TLS handshake failed");
                         return;
                     }
                 };
                 let service = service_fn(move |request| {
-                    proxy_request(request, peer, routes.clone(), client.clone())
+                    proxy_request(
+                        request,
+                        peer,
+                        routes.clone(),
+                        client.clone(),
+                        telemetry.clone(),
+                    )
                 });
                 if let Err(error) = Builder::new(TokioExecutor::new())
                     .serve_connection_with_upgrades(TokioIo::new(tls), service)
@@ -219,6 +235,7 @@ async fn proxy_request(
     peer: SocketAddr,
     routes: Arc<AsyncRwLock<BTreeMap<String, Route>>>,
     client: BackendClient,
+    telemetry: Telemetry,
 ) -> Result<Response<ProxyBody>, Infallible> {
     let Some(authority) = request_authority(&request) else {
         return Ok(text_response(
@@ -238,12 +255,23 @@ async fn proxy_request(
         ));
     };
 
-    match route {
+    let response = match route {
         Route::Http(port) => {
-            Ok(proxy_http_request(request, peer, client, authority, host, port).await)
+            proxy_http_request(
+                request,
+                peer,
+                client,
+                authority,
+                host.clone(),
+                port,
+                telemetry.clone(),
+            )
+            .await
         }
-        Route::Fanout(fanout) => Ok(fanout_request(request, host, fanout).await),
-    }
+        Route::Fanout(fanout) => fanout_request(request, host.clone(), fanout).await,
+    };
+    telemetry.request(&host, response.status().as_u16());
+    Ok(response)
 }
 
 async fn proxy_http_request(
@@ -253,6 +281,7 @@ async fn proxy_http_request(
     authority: String,
     host: String,
     port: u16,
+    telemetry: Telemetry,
 ) -> Response<ProxyBody> {
     let frontend_upgrade = is_upgrade_request(&request).then(|| hyper::upgrade::on(&mut request));
     let path = request
@@ -296,6 +325,7 @@ async fn proxy_http_request(
             )
         }
         Err(error) => {
+            telemetry.backend_failed(&host);
             warn!(%host, port, %error, "backend request failed");
             text_response(StatusCode::BAD_GATEWAY, "backend unavailable\n")
         }

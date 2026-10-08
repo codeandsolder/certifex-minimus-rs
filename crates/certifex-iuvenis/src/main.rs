@@ -1,5 +1,6 @@
 mod certificate;
 mod proxy;
+mod telemetry;
 
 use std::{
     fs, io,
@@ -14,6 +15,7 @@ use certifex_core::{
 use clap::Parser;
 use proxy::ProxyState;
 use reqwest::Client;
+use telemetry::Telemetry;
 use tokio::time::{Instant, sleep};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -41,6 +43,15 @@ struct Args {
 
     #[arg(long)]
     once: bool,
+
+    #[arg(long)]
+    metrics_endpoint: Option<String>,
+
+    #[arg(long)]
+    metrics_instance: Option<String>,
+
+    #[arg(long, default_value = "/var/lib/certifex-minimus/metrics-iuvenis")]
+    metrics_spool_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -53,18 +64,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    let metrics_instance = args
+        .metrics_instance
+        .clone()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    let telemetry = Telemetry::new(
+        args.metrics_endpoint.as_deref(),
+        &metrics_instance,
+        &args.metrics_spool_dir,
+    )?;
     let client = Client::builder().build()?;
-    let proxy = ProxyState::new();
+    let proxy = ProxyState::new(telemetry.clone());
     prepare_proxy(&args, &proxy).await?;
     let tailscale_ip = detect_tailscale_ip()?;
 
     if args.once {
-        reconcile(&client, &args, &proxy, tailscale_ip).await?;
+        match reconcile(&client, &args, &proxy, tailscale_ip).await {
+            Ok(_) => telemetry.reconcile_ok(),
+            Err(error) => {
+                telemetry.reconcile_failed();
+                return Err(error);
+            }
+        }
         return Ok(());
     }
 
     let proxy_task = proxy.clone().serve(tailscale_ip, args.https_port);
-    let reconciliation_task = reconciliation_loop(&client, &args, &proxy, tailscale_ip);
+    let reconciliation_task =
+        reconciliation_loop(&client, &args, &proxy, tailscale_ip, telemetry.clone());
     tokio::pin!(proxy_task);
     tokio::pin!(reconciliation_task);
 
@@ -79,6 +107,7 @@ async fn reconciliation_loop(
     args: &Args,
     proxy: &ProxyState,
     bound_tailscale_ip: IpAddr,
+    telemetry: Telemetry,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut baseline = fs::read(&args.config).unwrap_or_default();
     loop {
@@ -89,10 +118,12 @@ async fn reconciliation_loop(
         }
         let delay = match reconcile(client, args, proxy, bound_tailscale_ip).await {
             Ok(config_bytes) => {
+                telemetry.reconcile_ok();
                 baseline = config_bytes;
                 Duration::from_secs(args.poll_seconds.saturating_add(fastrand::u64(0..=900)))
             }
             Err(error) => {
+                telemetry.reconcile_failed();
                 warn!(%error, "registration failed; retrying");
                 Duration::from_secs(args.retry_seconds.saturating_add(fastrand::u64(0..=15)))
             }
@@ -175,6 +206,9 @@ async fn reconcile(
         certificate::validate_bundle(&certificate, &registration.hostnames, &identity)?;
         install_certificate(&args.state_dir, &certificate)?;
         proxy.reload_tls(&args.state_dir)?;
+        proxy
+            .telemetry()
+            .certificate_installed(certificate.generation);
         info!(
             node_id = %config.node_id,
             generation = certificate.generation,

@@ -1,5 +1,6 @@
 mod acme;
 mod cloudflare;
+mod telemetry;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -21,6 +22,7 @@ use certifex_core::{CertificateBundle, NodeRegistration, RegistrationResponse};
 use clap::Parser;
 use cloudflare::{Cloudflare, CloudflareError};
 use serde::{Deserialize, Serialize};
+use telemetry::Telemetry;
 use thiserror::Error;
 use tokio::{
     fs,
@@ -66,6 +68,15 @@ struct Args {
 
     #[arg(long, default_value_t = 3600)]
     renewal_check_seconds: u64,
+
+    #[arg(long)]
+    metrics_endpoint: Option<String>,
+
+    #[arg(long)]
+    metrics_instance: Option<String>,
+
+    #[arg(long, default_value = "/var/lib/certifex-minimus/metrics-senex")]
+    metrics_spool_dir: PathBuf,
 }
 
 #[derive(Clone)]
@@ -75,6 +86,7 @@ struct AppState {
 
 struct Controller {
     domain: String,
+    telemetry: Telemetry,
     cloudflare: Cloudflare,
     issuer: AcmeIssuer,
     nodes_dir: PathBuf,
@@ -118,6 +130,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    let metrics_instance = args
+        .metrics_instance
+        .clone()
+        .or_else(|| env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    let telemetry = Telemetry::new(
+        args.metrics_endpoint.as_deref(),
+        &metrics_instance,
+        &args.metrics_spool_dir,
+    )?;
     let token = load_cloudflare_token(&args)?;
     let client = reqwest::Client::builder().build()?;
     let cloudflare = Cloudflare::for_zone(client, token, &args.domain).await?;
@@ -129,8 +151,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(args.dns_propagation_seconds),
     )
     .await?;
-    let controller =
-        Arc::new(Controller::load(args.domain, args.state_dir, cloudflare, issuer).await?);
+    let controller = Arc::new(
+        Controller::load(args.domain, args.state_dir, cloudflare, issuer, telemetry).await?,
+    );
     let state = AppState {
         controller: controller.clone(),
     };
@@ -252,10 +275,12 @@ async fn register(
     Json(registration): Json<NodeRegistration>,
 ) -> Result<Json<RegistrationResponse>, (StatusCode, String)> {
     if let Err(error) = registration.validate() {
+        state.controller.telemetry.registration_failed();
         warn!(node_id = %registration.node_id, %error, "rejected registration");
         return Err((StatusCode::BAD_REQUEST, error.to_string()));
     }
     if !peer.ip().is_loopback() && peer.ip() != registration.tailscale_ip {
+        state.controller.telemetry.registration_failed();
         return Err((
             StatusCode::FORBIDDEN,
             format!(
@@ -269,6 +294,7 @@ async fn register(
     let node_id = registration.node_id.clone();
     match state.controller.reconcile(registration).await {
         Ok(response) => {
+            state.controller.telemetry.registration_ok();
             info!(%node_id, "node reconciliation complete");
             Ok(Json(response))
         }
@@ -277,10 +303,12 @@ async fn register(
             | ControllerError::NameCollision { .. }
             | ControllerError::InvalidTailscaleIp(_)),
         ) => {
+            state.controller.telemetry.registration_failed();
             warn!(%node_id, %error, "rejected registration");
             Err((StatusCode::CONFLICT, error.to_string()))
         }
         Err(error) => {
+            state.controller.telemetry.registration_failed();
             warn!(%node_id, %error, "registration reconciliation failed");
             Err((StatusCode::BAD_GATEWAY, error.to_string()))
         }
@@ -293,6 +321,7 @@ impl Controller {
         state_dir: PathBuf,
         cloudflare: Cloudflare,
         issuer: AcmeIssuer,
+        telemetry: Telemetry,
     ) -> Result<Self, ControllerError> {
         let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         let nodes_dir = state_dir.join("nodes");
@@ -308,6 +337,7 @@ impl Controller {
         }
         Ok(Self {
             domain,
+            telemetry,
             cloudflare,
             issuer,
             nodes_dir,
@@ -388,7 +418,16 @@ impl Controller {
         self.nodes
             .write()
             .await
-            .insert(registration.node_id.clone(), stored);
+            .insert(registration.node_id.clone(), stored.clone());
+        self.telemetry.node_state(
+            &registration.node_id,
+            stored.certificate.generation,
+            stored.renewal.as_ref().map(|schedule| schedule.renew_after),
+            stored
+                .renewal
+                .as_ref()
+                .and_then(|schedule| schedule.ari_check_after),
+        );
 
         if let Some(previous) = &old {
             let current = registration.hostnames.iter().collect::<BTreeSet<_>>();
@@ -411,6 +450,7 @@ impl Controller {
         let node_ids = self.nodes.read().await.keys().cloned().collect::<Vec<_>>();
         for node_id in node_ids {
             if let Err(error) = self.maintain_node_renewal(&node_id).await {
+                self.telemetry.renewal_failed();
                 warn!(%node_id, %error, "certificate renewal maintenance failed");
             }
         }
@@ -459,6 +499,15 @@ impl Controller {
 
         if schedule_refreshed || renewed {
             self.persist_node(&stored).await?;
+            self.telemetry.node_state(
+                node_id,
+                stored.certificate.generation,
+                stored.renewal.as_ref().map(|schedule| schedule.renew_after),
+                stored
+                    .renewal
+                    .as_ref()
+                    .and_then(|schedule| schedule.ari_check_after),
+            );
             self.nodes.write().await.insert(node_id.to_owned(), stored);
         }
         Ok(())
@@ -516,6 +565,7 @@ impl Controller {
                 .renewal_schedule(&certificate_chain_pem, None)
                 .await?,
         );
+        self.telemetry.certificate_issued();
         Ok((
             CertificateBundle {
                 generation,
