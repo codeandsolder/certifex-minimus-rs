@@ -112,7 +112,25 @@ fn exact_dns_names(names: &[GeneralName<'_>]) -> Result<Vec<String>, Certificate
 
 #[cfg(test)]
 mod tests {
+    use rcgen::{CertificateParams, KeyPair};
+
     use super::*;
+
+    fn self_signed_bundle(
+        names: &[String],
+    ) -> Result<(CertificateBundle, NodeIdentity), Box<dyn std::error::Error>> {
+        let key = KeyPair::generate()?;
+        let identity = NodeIdentity::from_private_key_pem(&key.serialize_pem())?;
+        let certificate = CertificateParams::new(names.to_vec())?.self_signed(&key)?;
+        Ok((
+            CertificateBundle {
+                generation: 1,
+                hostnames: names.to_vec(),
+                certificate_chain_pem: certificate.pem(),
+            },
+            identity,
+        ))
+    }
 
     #[test]
     fn exact_dns_names_accepts_only_dns_entries() -> Result<(), CertificateError> {
@@ -137,5 +155,47 @@ mod tests {
             exact_dns_names(&names),
             Err(CertificateError::NonDnsSan)
         ));
+    }
+
+    #[test]
+    fn bundle_validation_rejects_wrong_key_before_trust() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let names = vec!["one.example".to_owned()];
+        let (bundle, _identity) = self_signed_bundle(&names)?;
+        let wrong_identity = NodeIdentity::generate()?;
+
+        assert!(matches!(
+            validate_bundle(&bundle, &names, &wrong_identity),
+            Err(CertificateError::PublicKeyMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn bundle_validation_rejects_wrong_certificate_names_before_trust()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let certificate_names = vec!["other.example".to_owned()];
+        let expected_names = vec!["one.example".to_owned()];
+        let (mut bundle, identity) = self_signed_bundle(&certificate_names)?;
+        bundle.hostnames.clone_from(&expected_names);
+
+        assert!(matches!(
+            validate_bundle(&bundle, &expected_names, &identity),
+            Err(CertificateError::CertificateNamesMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn matching_self_signed_bundle_reaches_public_trust_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let names = vec!["one.example".to_owned()];
+        let (bundle, identity) = self_signed_bundle(&names)?;
+
+        assert!(matches!(
+            validate_bundle(&bundle, &names, &identity),
+            Err(CertificateError::Trust { .. })
+        ));
+        Ok(())
     }
 }

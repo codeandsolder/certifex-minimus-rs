@@ -407,11 +407,7 @@ impl Controller {
             for old_name in &previous.registration.hostnames {
                 self.cloudflare.delete_owned_a(old_name).await?;
             }
-            let tombstone = StoredNode {
-                registration: registration.clone(),
-                certificate: previous.certificate.clone(),
-                renewal: None,
-            };
+            let tombstone = deregistration_tombstone(registration, previous);
             self.persist_node(&tombstone).await?;
             self.nodes
                 .write()
@@ -687,6 +683,14 @@ async fn durable_replace(path: &std::path::Path, contents: &[u8]) -> io::Result<
     result
 }
 
+fn deregistration_tombstone(registration: &NodeRegistration, previous: &StoredNode) -> StoredNode {
+    StoredNode {
+        registration: registration.clone(),
+        certificate: previous.certificate.clone(),
+        renewal: None,
+    }
+}
+
 fn registration_identity_allowed(
     previous: &NodeRegistration,
     registration: &NodeRegistration,
@@ -776,6 +780,48 @@ mod tests {
         let mut relinquished = previous;
         relinquished.hostnames.clear();
         assert!(registration_identity_allowed(&relinquished, &new_key)?);
+        Ok(())
+    }
+
+    #[test]
+    fn deregistration_tombstone_releases_names_but_preserves_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let identity = NodeIdentity::generate()?;
+        let previous = StoredNode {
+            registration: NodeRegistration {
+                node_id: "node".to_owned(),
+                tailscale_ip: IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+                hostnames: vec!["one.example.com".to_owned()],
+                csr_pem: identity.csr_pem(&["one.example.com".to_owned()])?,
+                installed_generation: Some(41),
+            },
+            certificate: CertificateBundle {
+                generation: 41,
+                hostnames: vec!["one.example.com".to_owned()],
+                certificate_chain_pem: "certificate".to_owned(),
+            },
+            renewal: Some(RenewalSchedule {
+                renew_after: 123,
+                ari_check_after: Some(456),
+                ari_window_start: None,
+                ari_window_end: None,
+            }),
+        };
+        let replacement_identity = NodeIdentity::generate()?;
+        let deregistration = NodeRegistration {
+            node_id: "node".to_owned(),
+            tailscale_ip: IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+            hostnames: Vec::new(),
+            csr_pem: replacement_identity.csr_pem(&[])?,
+            installed_generation: Some(41),
+        };
+
+        let tombstone = deregistration_tombstone(&deregistration, &previous);
+
+        assert_eq!(tombstone.registration.hostnames, Vec::<String>::new());
+        assert_eq!(tombstone.certificate.generation, 41);
+        assert_eq!(tombstone.certificate.hostnames, vec!["one.example.com"]);
+        assert!(tombstone.renewal.is_none());
         Ok(())
     }
 

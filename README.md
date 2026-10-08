@@ -1,8 +1,14 @@
 # certifex-minimus-rs
 
-Tiny tailnet service naming and HTTPS ingress.
+[![CI](https://github.com/codeandsolder/certifex-minimus-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/codeandsolder/certifex-minimus-rs/actions/workflows/ci.yml)
 
-`certifex-senex` is the central registrar/control plane. `certifex-iuvenis` runs on each service node. The intended v1 model is deliberately small:
+**Browser-trusted HTTPS and normal DNS names for Tailscale-only localhost services — without a central traffic proxy or private CA.**
+
+Certifex Minimus turns services such as `127.0.0.1:3000` into ordinary URLs such as `https://grafana.example.com`. Public DNS points the name at the node's Tailscale CGNAT address, the node terminates a normal ACME certificate itself, and traffic stays end-to-end on the tailnet.
+
+It is deliberately small: Rust, Cloudflare DNS, ACME DNS-01 / Let's Encrypt, and Tailscale are the whole idea. `certifex-senex` is the central registrar/control plane; `certifex-iuvenis` runs on each service node.
+
+## How it works
 
 ```text
 browser on tailnet
@@ -20,6 +26,13 @@ certifex-iuvenis on 100.64.12.34:443
 ```
 
 The DNS records are public, ordinary unproxied `A` records, but the destination addresses are Tailscale CGNAT addresses (`100.64.0.0/10`). A machine without the tailnet route cannot reach the services. Certificates are normal publicly trusted multi-SAN ACME certificates, so browsers do not need a private CA installed.
+
+### Why this exists
+
+- **Normal custom-domain URLs:** use `https://grafana.example.com`, not a special proxy hostname or a locally trusted CA.
+- **Nothing public except DNS:** DNS-01 proves control of the name; the service itself remains reachable only through Tailscale.
+- **No central data-plane bottleneck:** the registrar handles DNS and certificates, then browsers connect directly to the target node.
+- **Tiny node configuration:** map labels to localhost ports; certificate issuance, renewal, DNS reconciliation, and hot reload are automatic.
 
 ## What each side owns
 
