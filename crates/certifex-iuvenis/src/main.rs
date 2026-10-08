@@ -195,7 +195,14 @@ async fn reconcile(
         .json::<RegistrationResponse>()
         .await?;
 
-    if let Some(certificate) = response.certificate {
+    if registration.hostnames.is_empty() {
+        proxy.clear_tls()?;
+        clear_certificate_state(&args.state_dir)?;
+        info!(
+            node_id = %config.node_id,
+            "registration relinquished all hostnames and disabled TLS ingress"
+        );
+    } else if let Some(certificate) = response.certificate {
         if installed_generation.is_some_and(|generation| certificate.generation < generation) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -295,6 +302,17 @@ fn install_certificate(state_dir: &Path, certificate: &CertificateBundle) -> io:
     )
 }
 
+fn clear_certificate_state(state_dir: &Path) -> io::Result<()> {
+    for filename in ["certificate-generation", "certificate.pem"] {
+        match fs::remove_file(state_dir.join(filename)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    sync_directory(state_dir)
+}
+
 fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     use std::io::Write;
 
@@ -380,19 +398,38 @@ fn write_private_key(path: &Path, pem: &str) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true).mode(0o600);
-    let mut file = options.open(path)?;
-    file.write_all(pem.as_bytes())?;
-    file.sync_all()?;
-    drop(file);
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "private key path has no parent directory",
         )
     })?;
-    sync_directory(parent)
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private key path has no UTF-8 filename",
+            )
+        })?;
+    let temporary = parent.join(format!(".{filename}.{:016x}.tmp", fastrand::u64(..)));
+
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        let mut file = options.open(&temporary)?;
+        file.write_all(pem.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::hard_link(&temporary, path)?;
+        fs::remove_file(&temporary)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[cfg(not(unix))]
@@ -414,6 +451,39 @@ mod tests {
         atomic_write(&path, b"1")?;
         atomic_write(&path, b"2")?;
         assert_eq!(fs::read(&path)?, b"2");
+        assert_eq!(fs::read_dir(&directory)?.count(), 1);
+
+        fs::remove_dir_all(directory)
+    }
+
+    #[test]
+    fn clearing_certificate_state_preserves_node_identity() -> io::Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("certifex-node-clear-{:016x}", fastrand::u64(..)));
+        fs::create_dir_all(&directory)?;
+        fs::write(directory.join("certificate.pem"), b"certificate")?;
+        fs::write(directory.join("certificate-generation"), b"17")?;
+        fs::write(directory.join("node-key.pem"), b"private-key")?;
+
+        clear_certificate_state(&directory)?;
+
+        assert!(!directory.join("certificate.pem").exists());
+        assert!(!directory.join("certificate-generation").exists());
+        assert_eq!(fs::read(directory.join("node-key.pem"))?, b"private-key");
+        fs::remove_dir_all(directory)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_key_publish_is_atomic_and_does_not_overwrite() -> io::Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("certifex-key-publish-{:016x}", fastrand::u64(..)));
+        fs::create_dir_all(&directory)?;
+        let path = directory.join("node-key.pem");
+
+        write_private_key(&path, "first")?;
+        assert!(write_private_key(&path, "second").is_err());
+        assert_eq!(fs::read_to_string(&path)?, "first");
         assert_eq!(fs::read_dir(&directory)?.count(), 1);
 
         fs::remove_dir_all(directory)

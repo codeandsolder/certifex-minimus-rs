@@ -1,8 +1,14 @@
 # certifex-minimus-rs
 
-Tiny tailnet service naming and HTTPS ingress.
+[![CI](https://github.com/codeandsolder/certifex-minimus-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/codeandsolder/certifex-minimus-rs/actions/workflows/ci.yml)
 
-`certifex-senex` is the central registrar/control plane. `certifex-iuvenis` runs on each service node. The intended v1 model is deliberately small:
+**Browser-trusted HTTPS and normal DNS names for Tailscale-only localhost services — without a central traffic proxy or private CA.**
+
+Certifex Minimus turns services such as `127.0.0.1:3000` into ordinary URLs such as `https://grafana.example.com`. Public DNS points the name at the node's Tailscale CGNAT address, the node terminates a normal ACME certificate itself, and traffic stays end-to-end on the tailnet.
+
+It is deliberately small: Rust, Cloudflare DNS, ACME DNS-01 / Let's Encrypt, and Tailscale are the whole idea. `certifex-senex` is the central registrar/control plane; `certifex-iuvenis` runs on each service node.
+
+## How it works
 
 ```text
 browser on tailnet
@@ -21,6 +27,13 @@ certifex-iuvenis on 100.64.12.34:443
 
 The DNS records are public, ordinary unproxied `A` records, but the destination addresses are Tailscale CGNAT addresses (`100.64.0.0/10`). A machine without the tailnet route cannot reach the services. Certificates are normal publicly trusted multi-SAN ACME certificates, so browsers do not need a private CA installed.
 
+### Why this exists
+
+- **Normal custom-domain URLs:** use `https://grafana.example.com`, not a special proxy hostname or a locally trusted CA.
+- **Nothing public except DNS:** DNS-01 proves control of the name; the service itself remains reachable only through Tailscale.
+- **No central data-plane bottleneck:** the registrar handles DNS and certificates, then browsers connect directly to the target node.
+- **Tiny node configuration:** map labels to localhost ports; certificate issuance, renewal, DNS reconciliation, and hot reload are automatic.
+
 ## What each side owns
 
 ### `certifex-iuvenis` — node/data plane
@@ -34,7 +47,9 @@ The DNS records are public, ordinary unproxied `A` records, but the destination 
 - routes by the original HTTP authority/`Host` to configured localhost ports;
 - supports HTTP/1.1 and HTTP/2 ingress, streaming bodies, and HTTP upgrade/WebSocket tunneling;
 - hot-loads new certificate generations for future handshakes without dropping existing connections;
-- notices node config changes while running.
+- notices node config changes while running;
+- treats an empty service set as full deregistration, removing the local serving certificate and
+  generation while retaining the node private key for future re-enrollment.
 
 If persisted certificate state is corrupt or no longer matches the private key, the node stays alive with TLS disabled, reports no usable installed generation, and lets the registrar repair it instead of getting stuck in a restart loop.
 
@@ -44,10 +59,13 @@ If persisted certificate state is corrupt or no longer matches the private key, 
 - accepts only Tailscale IPv4 claims and rejects a remote registration whose TCP source address differs from the claimed address;
 - only permits names below the configured base domain;
 - keeps hostname ownership stable across restarts and rejects collisions between nodes;
-- reconciles unproxied Cloudflare `A` records to the node Tailscale address and removes names a node relinquishes;
-- completes ACME DNS-01 challenges in parallel, then removes challenge TXT records;
+- reconciles unproxied Cloudflare `A` records to the node Tailscale address and requires relinquished
+  names to be removed before committing replacement node state;
+- provisions all required ACME DNS-01 challenge records before validation, then removes challenge TXT records;
 - stores the issued chain plus generation centrally so offline/rebuilt nodes can fetch it later;
-- treats a changed CSR/key as requiring a new certificate even when the SAN set did not change;
+- retains an inactive generation tombstone after full deregistration, preventing a crash between remote deregistration and local cleanup from turning the next enrollment into an apparent rollback;
+- binds an active node ID to its CSR public key, so another tailnet peer cannot take over persisted hostname ownership by reusing the node ID;
+- treats a changed CSR/SAN set under the same node key as requiring a new certificate;
 - renews centrally while nodes may be offline;
 - follows ACME Renewal Information (ARI), persisting a randomized point inside the CA's suggested renewal window; if ARI is unsupported it renews at two-thirds of certificate lifetime, and transient ARI failures retain the previous safe target while retrying ARI later.
 
@@ -101,8 +119,10 @@ CLOUDFLARE_API_TOKEN=... \
 For production, prefer a secret file or systemd credential rather than an environment variable. The registrar resolves the token in this order:
 
 1. `--cloudflare-token-file PATH`;
-2. systemd credential `${CREDENTIALS_DIRECTORY}/cloudflare-token`;
-3. the environment variable named by `--cloudflare-token-env` (default `CLOUDFLARE_API_TOKEN`).
+2. `--cloudflare-token-json-file PATH` (reads its string `value` field);
+3. systemd credential `${CREDENTIALS_DIRECTORY}/cloudflare-token`;
+4. systemd credential `${CREDENTIALS_DIRECTORY}/cloudflare-token-json`;
+5. the environment variable named by `--cloudflare-token-env` (default `CLOUDFLARE_API_TOKEN`).
 
 After an end-to-end staging issuance succeeds, switch to production explicitly:
 
@@ -129,7 +149,7 @@ The units use:
 
 The registrar API itself is intentionally minimal and currently relies on the tailnet as the authenticated network boundary plus source-address matching. It should be reachable only over Tailscale (and ideally constrained with Tailscale ACLs/firewall policy); do **not** expose the registrar port to the public Internet.
 
-A peer that is already trusted onto the reachable tailnet can attempt first registration of an otherwise-unclaimed service name. Existing ownership cannot be silently stolen because names are persisted and collision-checked, but v1 does not yet have a second application-layer enrollment secret or Tailscale identity API check.
+A peer that is already trusted onto the reachable tailnet can attempt first registration of an otherwise-unclaimed service name. Active node IDs are bound to the public key in their first validated CSR, while hostname ownership is persisted and collision-checked, so a different peer cannot take over an existing registration merely by reusing its node ID. Full deregistration releases that key binding but retains only the last certificate generation as an inactive tombstone; a later enrollment may therefore use a new key without resetting generation numbering. v1 does not yet have a second application-layer enrollment secret or Tailscale identity API check.
 
 The node still treats the registrar as untrusted with respect to private-key possession: it accepts a returned certificate only when the chain is publicly valid, the SAN set is exactly what the node requested, and the leaf public key matches the private key that never left the node.
 
@@ -138,7 +158,7 @@ The node still treats the registrar as untrusted with respect to private-key pos
 The proxy path has been exercised on a real Tailscale node with:
 
 - HTTP/2 client ingress translated to HTTP/1.1 localhost origin traffic;
-- preservation of the external `Host`/authority and `X-Forwarded-{Host,Proto,For}`;
+- preservation of the external `Host`/authority, `X-Forwarded-{Host,Proto,For}`, and `X-Real-IP`;
 - unknown-host isolation (`404`);
 - RFC hop-by-hop header stripping;
 - a real `101 Switching Protocols` upgraded byte stream tunneled in both directions;

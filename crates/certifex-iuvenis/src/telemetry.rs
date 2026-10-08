@@ -106,6 +106,10 @@ impl Telemetry {
     }
 }
 
-fn metric_u64(value: u64) -> f64 {
-    f64::from(u32::try_from(value).unwrap_or(u32::MAX))
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the metrics backend stores samples as f64; retaining the full f64 integer range is preferable to clamping at u32::MAX"
+)]
+const fn metric_u64(value: u64) -> f64 {
+    value as f64
 }
