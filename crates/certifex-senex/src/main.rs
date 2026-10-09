@@ -449,10 +449,15 @@ impl Controller {
         registration: &NodeRegistration,
         previous: Option<&StoredNode>,
     ) -> Result<(CertificateBundle, Option<RenewalSchedule>), ControllerError> {
+        let same_key = previous
+            .map(|previous| {
+                same_csr_public_key(&previous.registration.csr_pem, &registration.csr_pem)
+            })
+            .transpose()?
+            .unwrap_or(false);
         match previous {
             Some(previous)
-                if previous.certificate.hostnames == registration.hostnames
-                    && previous.registration.csr_pem == registration.csr_pem =>
+                if previous.certificate.hostnames == registration.hostnames && same_key =>
             {
                 let mut renewal = previous.renewal.clone();
                 let now = unix_now();
@@ -704,6 +709,10 @@ fn deregistration_tombstone(registration: &NodeRegistration, previous: &StoredNo
     }
 }
 
+fn same_csr_public_key(left: &str, right: &str) -> Result<bool, IdentityError> {
+    Ok(csr_public_key_spki_der(left)? == csr_public_key_spki_der(right)?)
+}
+
 fn registration_identity_allowed(
     previous: &NodeRegistration,
     registration: &NodeRegistration,
@@ -711,8 +720,7 @@ fn registration_identity_allowed(
     if previous.hostnames.is_empty() {
         return Ok(true);
     }
-    Ok(csr_public_key_spki_der(&previous.csr_pem)?
-        == csr_public_key_spki_der(&registration.csr_pem)?)
+    same_csr_public_key(&previous.csr_pem, &registration.csr_pem)
 }
 
 fn replacement_chain<'a>(
@@ -803,6 +811,21 @@ mod tests {
         let mut relinquished = previous;
         relinquished.hostnames.clear();
         assert!(registration_identity_allowed(&relinquished, &new_key)?);
+        Ok(())
+    }
+
+    #[test]
+    fn certificate_identity_uses_public_key_not_csr_bytes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let identity = NodeIdentity::generate()?;
+        let other_identity = NodeIdentity::generate()?;
+        let names = vec!["one.example.com".to_owned()];
+        let first = identity.csr_pem(&names)?;
+        let second = identity.csr_pem(&names)?;
+        let other = other_identity.csr_pem(&names)?;
+
+        assert!(same_csr_public_key(&first, &second)?);
+        assert!(!same_csr_public_key(&first, &other)?);
         Ok(())
     }
 
