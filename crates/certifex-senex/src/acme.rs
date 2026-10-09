@@ -154,6 +154,10 @@ impl AcmeIssuer {
                 Err(InstantAcmeError::Unsupported(_)) => {
                     self.account.new_order(&NewOrder::new(&identifiers)).await?
                 }
+                Err(error) if is_already_replaced(&error) => {
+                    warn!(%error, "ACME replacement was already consumed; retrying as a normal order");
+                    self.account.new_order(&NewOrder::new(&identifiers)).await?
+                }
                 Err(error) => return Err(error.into()),
             }
         } else {
@@ -297,6 +301,17 @@ impl AcmeIssuer {
     }
 }
 
+fn is_already_replaced(error: &InstantAcmeError) -> bool {
+    matches!(
+        error,
+        InstantAcmeError::Api(problem)
+            if problem
+                .r#type
+                .as_deref()
+                .is_some_and(|kind| kind.ends_with(":alreadyReplaced"))
+    )
+}
+
 fn leaf_certificate_der(certificate_chain_pem: &str) -> Result<CertificateDer<'static>, AcmeError> {
     let blocks = pem::parse_many(certificate_chain_pem.as_bytes())?;
     let leaf = blocks
@@ -421,6 +436,25 @@ mod tests {
     use rcgen::{CertificateParams, KeyPair};
 
     use super::*;
+
+    #[test]
+    fn detects_already_replaced_acme_problem() {
+        let error = InstantAcmeError::Api(instant_acme::Problem {
+            r#type: Some("urn:ietf:params:acme:error:alreadyReplaced".to_owned()),
+            detail: None,
+            status: Some(400),
+            subproblems: Vec::new(),
+        });
+        assert!(is_already_replaced(&error));
+
+        let unrelated = InstantAcmeError::Api(instant_acme::Problem {
+            r#type: Some("urn:ietf:params:acme:error:rateLimited".to_owned()),
+            detail: None,
+            status: Some(429),
+            subproblems: Vec::new(),
+        });
+        assert!(!is_already_replaced(&unrelated));
+    }
 
     #[test]
     fn missing_aki_disables_ari_without_disabling_fallback()

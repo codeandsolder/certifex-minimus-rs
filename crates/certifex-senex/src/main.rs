@@ -38,6 +38,7 @@ use tracing_subscriber::EnvFilter;
 
 const LETS_ENCRYPT_STAGING: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
 const MAX_REGISTRATION_BODY_BYTES: usize = 256 * 1024;
+const RENEWAL_FAILURE_BACKOFF_SECONDS: i64 = 6 * 60 * 60;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Certifex registrar and certificate control plane")]
@@ -468,19 +469,11 @@ impl Controller {
                             .await?,
                     );
                 }
-                if renewal
-                    .as_ref()
-                    .is_some_and(|schedule| schedule.renewal_due(now))
-                {
-                    self.issue_bundle(
-                        registration,
-                        previous.certificate.generation.saturating_add(1),
-                        Some(&previous.certificate.certificate_chain_pem),
-                    )
-                    .await
-                } else {
-                    Ok((previous.certificate.clone(), renewal))
-                }
+                // Registration is a reconciliation path, not the renewal scheduler.
+                // Retrying a due renewal here couples the node retry cadence (30s by default)
+                // to ACME issuance and can hammer the CA after a terminal/rate-limit error.
+                // The registrar's maintenance loop owns renewal attempts.
+                Ok((previous.certificate.clone(), renewal))
             }
             Some(previous) => {
                 let replacement = replacement_chain(previous, registration);
@@ -539,13 +532,33 @@ impl Controller {
         {
             let generation = stored.certificate.generation.saturating_add(1);
             let old_chain = stored.certificate.certificate_chain_pem.clone();
-            let (certificate, renewal) = self
+            match self
                 .issue_bundle(&stored.registration, generation, Some(&old_chain))
-                .await?;
-            info!(%node_id, generation, "renewed certificate while node may be offline");
-            stored.certificate = certificate;
-            stored.renewal = renewal;
-            true
+                .await
+            {
+                Ok((certificate, renewal)) => {
+                    info!(%node_id, generation, "renewed certificate while node may be offline");
+                    stored.certificate = certificate;
+                    stored.renewal = renewal;
+                    true
+                }
+                Err(error) => {
+                    if let Some(schedule) = stored.renewal.as_mut() {
+                        defer_renewal_after_failure(schedule, now);
+                        let renew_after = schedule.renew_after;
+                        let ari_check_after = schedule.ari_check_after;
+                        self.persist_node(&stored).await?;
+                        self.telemetry.node_state(
+                            node_id,
+                            stored.certificate.generation,
+                            Some(renew_after),
+                            ari_check_after,
+                        );
+                        self.nodes.write().await.insert(node_id.to_owned(), stored);
+                    }
+                    return Err(error);
+                }
+            }
         } else {
             false
         };
@@ -714,6 +727,16 @@ fn replacement_chain<'a>(
         .then_some(previous.certificate.certificate_chain_pem.as_str())
 }
 
+fn defer_renewal_after_failure(schedule: &mut RenewalSchedule, now: i64) {
+    let retry_at = now.saturating_add(RENEWAL_FAILURE_BACKOFF_SECONDS);
+    schedule.renew_after = schedule.renew_after.max(retry_at);
+    schedule.ari_check_after = Some(
+        schedule
+            .ari_check_after
+            .map_or(retry_at, |deadline| deadline.max(retry_at)),
+    );
+}
+
 fn encoded_node_id(node_id: &str) -> String {
     let mut result = String::with_capacity(node_id.len());
     for byte in node_id.bytes() {
@@ -823,6 +846,25 @@ mod tests {
         assert_eq!(tombstone.certificate.hostnames, vec!["one.example.com"]);
         assert!(tombstone.renewal.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn failed_renewal_defers_both_issue_and_ari_retry() {
+        let now = 1_000_000;
+        let mut schedule = RenewalSchedule {
+            renew_after: now - 1,
+            ari_check_after: Some(now - 10),
+            ari_window_start: Some(now - 100),
+            ari_window_end: Some(now + 100),
+        };
+
+        defer_renewal_after_failure(&mut schedule, now);
+
+        let retry_at = now + RENEWAL_FAILURE_BACKOFF_SECONDS;
+        assert_eq!(schedule.renew_after, retry_at);
+        assert_eq!(schedule.ari_check_after, Some(retry_at));
+        assert!(!schedule.renewal_due(retry_at - 1));
+        assert!(schedule.renewal_due(retry_at));
     }
 
     #[test]
