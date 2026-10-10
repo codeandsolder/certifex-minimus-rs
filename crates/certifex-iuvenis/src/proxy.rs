@@ -145,7 +145,7 @@ impl ProxyState {
         let mut config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certificates, key)?;
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.alpn_protocols = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
         *self.tls.write().map_err(|_| ProxyError::PoisonedTlsLock)? = Some(Arc::new(config));
         Ok(())
     }
