@@ -49,6 +49,7 @@ const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const TUNNEL_BUFFER_BYTES: usize = 64 * 1024;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ProxyBody = BoxBody<Bytes, BoxError>;
@@ -469,7 +470,14 @@ async fn tunnel_connect(
         }
     };
     let mut frontend = TokioIo::new(frontend);
-    if let Err(error) = tokio::io::copy_bidirectional(&mut frontend, &mut backend).await {
+    if let Err(error) = tokio::io::copy_bidirectional_with_sizes(
+        &mut frontend,
+        &mut backend,
+        TUNNEL_BUFFER_BYTES,
+        TUNNEL_BUFFER_BYTES,
+    )
+    .await
+    {
         debug!(%host, port, %error, "fanout TCP tunnel ended with error");
     }
 }
@@ -488,7 +496,14 @@ async fn tunnel_upgrade(
     };
     let mut frontend = TokioIo::new(frontend);
     let mut backend = TokioIo::new(backend);
-    if let Err(error) = tokio::io::copy_bidirectional(&mut frontend, &mut backend).await {
+    if let Err(error) = tokio::io::copy_bidirectional_with_sizes(
+        &mut frontend,
+        &mut backend,
+        TUNNEL_BUFFER_BYTES,
+        TUNNEL_BUFFER_BYTES,
+    )
+    .await
+    {
         debug!(%host, %error, "upgraded connection tunnel ended with error");
     }
 }
