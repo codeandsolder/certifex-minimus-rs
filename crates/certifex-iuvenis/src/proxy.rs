@@ -35,7 +35,6 @@ use thiserror::Error;
 use tokio::{
     fs,
     net::{TcpListener, TcpStream},
-    sync::RwLock as AsyncRwLock,
     time::timeout,
 };
 use tokio_rustls::TlsAcceptor;
@@ -58,7 +57,7 @@ type BackendClient = Client<HttpConnector, Incoming>;
 #[derive(Clone)]
 enum Route {
     Http(u16),
-    Fanout(FanoutConfig),
+    Fanout(Arc<FanoutConfig>),
 }
 
 #[derive(Debug, Error)]
@@ -75,6 +74,8 @@ pub enum ProxyError {
     Tls(#[from] rustls::Error),
     #[error("proxy TLS configuration lock is poisoned")]
     PoisonedTlsLock,
+    #[error("proxy route table lock is poisoned")]
+    PoisonedRoutesLock,
     #[error("service configuration is invalid: {0}")]
     Config(#[from] ConfigError),
 }
@@ -82,7 +83,7 @@ pub enum ProxyError {
 #[derive(Clone)]
 pub struct ProxyState {
     tls: Arc<RwLock<Option<Arc<ServerConfig>>>>,
-    routes: Arc<AsyncRwLock<BTreeMap<String, Route>>>,
+    routes: Arc<RwLock<BTreeMap<String, Route>>>,
     telemetry: Telemetry,
 }
 
@@ -91,7 +92,7 @@ impl ProxyState {
     pub fn new(telemetry: Telemetry) -> Self {
         Self {
             tls: Arc::new(RwLock::new(None)),
-            routes: Arc::new(AsyncRwLock::new(BTreeMap::new())),
+            routes: Arc::new(RwLock::new(BTreeMap::new())),
             telemetry,
         }
     }
@@ -105,16 +106,22 @@ impl ProxyState {
     ///
     /// # Errors
     /// Returns an error if the node configuration is invalid.
-    pub async fn set_routes(&self, config: &NodeConfig) -> Result<(), ProxyError> {
+    pub fn set_routes(&self, config: &NodeConfig) -> Result<(), ProxyError> {
         let domain = config.canonical_domain()?;
         let mut routes = BTreeMap::new();
         for (label, port) in &config.services {
             routes.insert(format!("{label}.{domain}"), Route::Http(*port));
         }
         for (label, fanout) in &config.fanouts {
-            routes.insert(format!("{label}.{domain}"), Route::Fanout(fanout.clone()));
+            routes.insert(
+                format!("{label}.{domain}"),
+                Route::Fanout(Arc::new(fanout.clone())),
+            );
         }
-        *self.routes.write().await = routes;
+        *self
+            .routes
+            .write()
+            .map_err(|_| ProxyError::PoisonedRoutesLock)? = routes;
         Ok(())
     }
 
@@ -247,7 +254,7 @@ impl ProxyState {
 async fn proxy_request(
     request: Request<Incoming>,
     peer: SocketAddr,
-    routes: Arc<AsyncRwLock<BTreeMap<String, Route>>>,
+    routes: Arc<RwLock<BTreeMap<String, Route>>>,
     client: BackendClient,
     telemetry: Telemetry,
 ) -> Result<Response<ProxyBody>, Infallible> {
@@ -259,8 +266,15 @@ async fn proxy_request(
     };
     let host = normalize_host(&authority);
     let route = {
-        let routes = routes.read().await;
-        routes.get(&host).cloned()
+        let Ok(routes_guard) = routes.read() else {
+            warn!(%host, "proxy route table lock is poisoned");
+            telemetry.request(&host, StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+            return Ok(text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "proxy route state unavailable\n",
+            ));
+        };
+        routes_guard.get(&host).cloned()
     };
     let Some(route) = route else {
         return Ok(text_response(
@@ -282,7 +296,7 @@ async fn proxy_request(
             )
             .await
         }
-        Route::Fanout(fanout) => fanout_request(request, host.clone(), fanout).await,
+        Route::Fanout(fanout) => fanout_request(request, host.clone(), fanout.as_ref()).await,
     };
     telemetry.request(&host, response.status().as_u16());
     Ok(response)
@@ -349,7 +363,7 @@ async fn proxy_http_request(
 async fn fanout_request(
     mut request: Request<Incoming>,
     host: String,
-    fanout: FanoutConfig,
+    fanout: &FanoutConfig,
 ) -> Response<ProxyBody> {
     let path = request.uri().path();
     if let Some(route) = fanout.files.iter().find(|route| route.path == path) {
@@ -365,7 +379,7 @@ async fn fanout_request(
             "TCP fanout requires HTTP/1.1 CONNECT\n",
         );
     }
-    let Some(port) = tcp_port_for_path(&fanout, path) else {
+    let Some(port) = tcp_port_for_path(fanout, path) else {
         return text_response(StatusCode::NOT_FOUND, "unknown fanout route\n");
     };
     let backend = match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(("127.0.0.1", port))).await

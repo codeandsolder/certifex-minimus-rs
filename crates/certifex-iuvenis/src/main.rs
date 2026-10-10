@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let client = RegistrarClient::new();
     let proxy = ProxyState::new(telemetry.clone());
-    prepare_proxy(&args, &proxy).await?;
+    prepare_proxy(&args, &proxy)?;
     let tailscale_ip = detect_tailscale_ip()?;
 
     if args.once {
@@ -138,9 +138,9 @@ async fn reconciliation_loop(
     }
 }
 
-async fn prepare_proxy(args: &Args, proxy: &ProxyState) -> Result<(), Box<dyn std::error::Error>> {
+fn prepare_proxy(args: &Args, proxy: &ProxyState) -> Result<(), Box<dyn std::error::Error>> {
     let config: NodeConfig = toml::from_str(&fs::read_to_string(&args.config)?)?;
-    proxy.set_routes(&config).await?;
+    proxy.set_routes(&config)?;
     fs::create_dir_all(&args.state_dir)?;
     let key_path = args.state_dir.join("node-key.pem");
     let _identity = load_or_create_identity(&key_path)?;
@@ -164,7 +164,7 @@ async fn reconcile(
     let config_bytes = fs::read(&args.config)?;
     let config: NodeConfig = toml::from_str(std::str::from_utf8(&config_bytes)?)?;
     let hostnames = config.hostnames()?;
-    proxy.set_routes(&config).await?;
+    proxy.set_routes(&config)?;
     fs::create_dir_all(&args.state_dir)?;
 
     let key_path = args.state_dir.join("node-key.pem");
