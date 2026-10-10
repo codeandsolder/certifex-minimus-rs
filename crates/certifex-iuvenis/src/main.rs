@@ -1,5 +1,6 @@
 mod certificate;
 mod proxy;
+mod registrar;
 mod telemetry;
 
 use std::{
@@ -9,12 +10,10 @@ use std::{
     time::Duration,
 };
 
-use certifex_core::{
-    CertificateBundle, NodeConfig, NodeIdentity, NodeRegistration, RegistrationResponse,
-};
+use certifex_core::{CertificateBundle, NodeConfig, NodeIdentity, NodeRegistration};
 use clap::Parser;
 use proxy::ProxyState;
-use reqwest::Client;
+use registrar::RegistrarClient;
 use telemetry::Telemetry;
 use tokio::time::{Instant, sleep};
 use tracing::{info, warn};
@@ -74,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &metrics_instance,
         &args.metrics_spool_dir,
     )?;
-    let client = Client::builder().build()?;
+    let client = RegistrarClient::new();
     let proxy = ProxyState::new(telemetry.clone());
     prepare_proxy(&args, &proxy).await?;
     let tailscale_ip = detect_tailscale_ip()?;
@@ -103,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn reconciliation_loop(
-    client: &Client,
+    client: &RegistrarClient,
     args: &Args,
     proxy: &ProxyState,
     bound_tailscale_ip: IpAddr,
@@ -157,7 +156,7 @@ async fn prepare_proxy(args: &Args, proxy: &ProxyState) -> Result<(), Box<dyn st
 }
 
 async fn reconcile(
-    client: &Client,
+    client: &RegistrarClient,
     args: &Args,
     proxy: &ProxyState,
     tailscale_ip: IpAddr,
@@ -186,14 +185,7 @@ async fn reconcile(
     };
 
     let endpoint = format!("{}/v1/register", config.registrar_url()?);
-    let response = client
-        .post(endpoint)
-        .json(&registration)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<RegistrationResponse>()
-        .await?;
+    let response = client.register(&endpoint, &registration).await?;
 
     if registration.hostnames.is_empty() {
         proxy.clear_tls()?;
