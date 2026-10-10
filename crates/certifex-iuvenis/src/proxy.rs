@@ -20,7 +20,6 @@ use hyper::{
         HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING,
         UPGRADE,
     },
-    http::uri::{Authority, PathAndQuery, Scheme},
     service::service_fn,
 };
 use hyper_util::{
@@ -56,14 +55,8 @@ type ProxyBody = BoxBody<Bytes, BoxError>;
 type BackendClient = Client<HttpConnector, Incoming>;
 
 #[derive(Clone)]
-struct HttpRoute {
-    port: u16,
-    backend_authority: Authority,
-}
-
-#[derive(Clone)]
 enum Route {
-    Http(HttpRoute),
+    Http(u16),
     Fanout(Arc<FanoutConfig>),
 }
 
@@ -83,8 +76,6 @@ pub enum ProxyError {
     PoisonedTlsLock,
     #[error("proxy route table lock is poisoned")]
     PoisonedRoutesLock,
-    #[error("invalid loopback backend authority: {0}")]
-    InvalidBackendAuthority(#[from] hyper::http::uri::InvalidUri),
     #[error("service configuration is invalid: {0}")]
     Config(#[from] ConfigError),
 }
@@ -119,14 +110,7 @@ impl ProxyState {
         let domain = config.canonical_domain()?;
         let mut routes = BTreeMap::new();
         for (label, port) in &config.services {
-            let backend_authority = format!("127.0.0.1:{port}").parse::<Authority>()?;
-            routes.insert(
-                format!("{label}.{domain}"),
-                Route::Http(HttpRoute {
-                    port: *port,
-                    backend_authority,
-                }),
-            );
+            routes.insert(format!("{label}.{domain}"), Route::Http(*port));
         }
         for (label, fanout) in &config.fanouts {
             routes.insert(
@@ -300,14 +284,14 @@ async fn proxy_request(
     };
 
     let response = match route {
-        Route::Http(route) => {
+        Route::Http(port) => {
             proxy_http_request(
                 request,
                 peer,
                 client,
                 authority,
                 host.clone(),
-                route,
+                port,
                 telemetry.clone(),
             )
             .await
@@ -324,14 +308,18 @@ async fn proxy_http_request(
     client: BackendClient,
     authority: String,
     host: String,
-    route: HttpRoute,
+    port: u16,
     telemetry: Telemetry,
 ) -> Response<ProxyBody> {
     let frontend_upgrade = is_upgrade_request(&request).then(|| hyper::upgrade::on(&mut request));
-    let uri = match backend_uri(route.backend_authority, request.uri()) {
+    let path = request
+        .uri()
+        .path_and_query()
+        .map_or("/", hyper::http::uri::PathAndQuery::as_str);
+    let uri = match format!("http://127.0.0.1:{port}{path}").parse::<Uri>() {
         Ok(uri) => uri,
         Err(error) => {
-            warn!(%host, port = route.port, %error, "failed to construct backend URI");
+            warn!(%host, port, %error, "failed to construct backend URI");
             return text_response(StatusCode::BAD_GATEWAY, "invalid backend URI\n");
         }
     };
@@ -366,7 +354,7 @@ async fn proxy_http_request(
         }
         Err(error) => {
             telemetry.backend_failed(&host);
-            warn!(%host, port = route.port, %error, "backend request failed");
+            warn!(%host, port, %error, "backend request failed");
             text_response(StatusCode::BAD_GATEWAY, "backend unavailable\n")
         }
     }
@@ -534,21 +522,6 @@ async fn tunnel_upgrade(
     }
 }
 
-fn backend_uri(
-    backend_authority: Authority,
-    frontend_uri: &Uri,
-) -> Result<Uri, hyper::http::uri::InvalidUriParts> {
-    let path_and_query = frontend_uri
-        .path_and_query()
-        .cloned()
-        .unwrap_or_else(|| PathAndQuery::from_static("/"));
-    let mut parts = hyper::http::uri::Parts::default();
-    parts.scheme = Some(Scheme::HTTP);
-    parts.authority = Some(backend_authority);
-    parts.path_and_query = Some(path_and_query);
-    Uri::from_parts(parts)
-}
-
 fn request_authority(request: &Request<Incoming>) -> Option<String> {
     request
         .headers()
@@ -651,16 +624,6 @@ fn text_response(status: StatusCode, body: &'static str) -> Response<ProxyBody> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn backend_uri_reuses_preparsed_authority_and_preserves_path_and_query()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let frontend: Uri = "https://service.example.com/api/v1/query?x=1".parse()?;
-        let authority = "127.0.0.1:8428".parse()?;
-        let backend = backend_uri(authority, &frontend)?;
-        assert_eq!(backend, "http://127.0.0.1:8428/api/v1/query?x=1");
-        Ok(())
-    }
 
     #[test]
     fn normalizes_hostnames_and_numeric_ports() {
