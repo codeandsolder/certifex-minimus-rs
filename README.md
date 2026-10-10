@@ -88,7 +88,7 @@ Service names are relative DNS names below the configured base domain, so a node
 
 ### Path fan-out services
 
-A node can also publish one hostname that selects among multiple local TCP backends by URL path. This is useful for replica banks, test workers, sharded local services, or any other node-local set where creating one DNS name per backend would be needless.
+A node can also publish one hostname with file routes and typed local stream tunnels. Stream targets use HTTP/1.1 `CONNECT` and may terminate at either loopback TCP or a Unix stream socket.
 
 ```toml
 [fanouts.workers]
@@ -97,14 +97,22 @@ A node can also publish one hostname that selects among multiple local TCP backe
 path = "/inventory.json"
 source = "/run/workers/inventory.json"
 
-[[fanouts.workers.tcp_ranges]]
-path_prefix = "/"
+[[fanouts.workers.streams]]
+path = "/control"
+transport = "unix-stream"
+socket = "/run/workers/control.sock"
+
+[[fanouts.workers.stream_ranges]]
+path_prefix = "/tcp/"
 first = 1
 last = 16
+host = "127.0.0.1"
 port_start = 9000
 ```
 
-The example requests `workers.example.com`; `port_start` is the backend port selected by `first`. `GET /inventory.json` and `HEAD /inventory.json` serve the current file directly with `Cache-Control: no-store`. An HTTP/1.1 `CONNECT /7` opens `127.0.0.1:9006`; after the `200 OK` response the connection is a raw bidirectional TCP tunnel. File routes take precedence over TCP ranges. Backends remain loopback-only by design.
+Exact stream targets support `tcp` and `unix-stream`; numeric stream ranges currently represent TCP port banks. IP targets must be loopback addresses and Unix socket paths must be absolute.
+
+A request such as `CONNECT /tcp/7` maps to `127.0.0.1:9006`; after the `200 OK`, the connection is a raw bidirectional byte stream. `CONNECT /control` reaches the configured Unix stream socket. File routes take precedence over stream routes. Stream relays use 64 KiB buffers, selected from the proxy-only benchmark rather than Tokio's 8 KiB default.
 
 ## Registrar startup
 

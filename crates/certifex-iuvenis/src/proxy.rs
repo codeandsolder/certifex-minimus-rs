@@ -10,7 +10,7 @@ use std::{
 
 use crate::telemetry::Telemetry;
 use bytes::Bytes;
-use certifex_core::{ConfigError, FanoutConfig, NodeConfig, TcpRangeRoute};
+use certifex_core::{ConfigError, FanoutConfig, NodeConfig, StreamRangeRoute, StreamTarget};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, StatusCode, Uri, Version,
@@ -34,7 +34,8 @@ use rustls::{
 use thiserror::Error;
 use tokio::{
     fs,
-    net::{TcpListener, TcpStream},
+    io::{AsyncRead, AsyncWrite},
+    net::{TcpListener, TcpStream, UnixStream},
     sync::RwLock as AsyncRwLock,
     time::timeout,
 };
@@ -351,39 +352,94 @@ async fn fanout_request(
     host: String,
     fanout: FanoutConfig,
 ) -> Response<ProxyBody> {
-    let path = request.uri().path();
+    let path = request.uri().path().to_owned();
     if let Some(route) = fanout.files.iter().find(|route| route.path == path) {
-        return file_response(request.method(), route.source.as_path(), &host, path).await;
+        return file_response(request.method(), route.source.as_path(), &host, &path).await;
     }
 
-    if request.method() != Method::CONNECT {
+    let Some(target) = stream_target_for_path(&fanout, &path) else {
         return text_response(StatusCode::NOT_FOUND, "unknown fanout route\n");
+    };
+
+    match target {
+        StreamTarget::Tcp { address } => {
+            if let Some(response) = require_stream_connect(&request) {
+                return response;
+            }
+            let backend = match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(address)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    warn!(%host, %address, %error, "fanout TCP backend unavailable");
+                    return text_response(StatusCode::BAD_GATEWAY, "backend unavailable\n");
+                }
+                Err(_) => {
+                    warn!(%host, %address, "fanout TCP backend connect timed out");
+                    return text_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "backend connect timed out\n",
+                    );
+                }
+            };
+            let frontend = hyper::upgrade::on(&mut request);
+            tokio::spawn(relay_stream(frontend, backend, host, address.to_string()));
+            empty_response(StatusCode::OK)
+        }
+        StreamTarget::UnixStream {
+            socket: socket_path,
+        } => {
+            if let Some(response) = require_stream_connect(&request) {
+                return response;
+            }
+            let backend =
+                match timeout(TCP_CONNECT_TIMEOUT, UnixStream::connect(&socket_path)).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        warn!(
+                            %host,
+                            path = %socket_path.display(),
+                            %error,
+                            "fanout Unix-stream backend unavailable"
+                        );
+                        return text_response(StatusCode::BAD_GATEWAY, "backend unavailable\n");
+                    }
+                    Err(_) => {
+                        warn!(
+                            %host,
+                            path = %socket_path.display(),
+                            "fanout Unix-stream backend connect timed out"
+                        );
+                        return text_response(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "backend connect timed out\n",
+                        );
+                    }
+                };
+            let frontend = hyper::upgrade::on(&mut request);
+            tokio::spawn(relay_stream(
+                frontend,
+                backend,
+                host,
+                socket_path.display().to_string(),
+            ));
+            empty_response(StatusCode::OK)
+        }
+    }
+}
+
+fn require_stream_connect(request: &Request<Incoming>) -> Option<Response<ProxyBody>> {
+    if request.method() != Method::CONNECT {
+        return Some(text_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "stream tunnel requires CONNECT\n",
+        ));
     }
     if request.version() != Version::HTTP_11 {
-        return text_response(
+        return Some(text_response(
             StatusCode::HTTP_VERSION_NOT_SUPPORTED,
-            "TCP fanout requires HTTP/1.1 CONNECT\n",
-        );
+            "stream tunnel requires HTTP/1.1 CONNECT\n",
+        ));
     }
-    let Some(port) = tcp_port_for_path(&fanout, path) else {
-        return text_response(StatusCode::NOT_FOUND, "unknown fanout route\n");
-    };
-    let backend = match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(("127.0.0.1", port))).await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => {
-            warn!(%host, port, %error, "fanout TCP backend unavailable");
-            return text_response(StatusCode::BAD_GATEWAY, "backend unavailable\n");
-        }
-        Err(_) => {
-            warn!(%host, port, "fanout TCP backend connect timed out");
-            return text_response(StatusCode::GATEWAY_TIMEOUT, "backend connect timed out\n");
-        }
-    };
-
-    let frontend = hyper::upgrade::on(&mut request);
-    tokio::spawn(tunnel_connect(frontend, backend, host, port));
-    empty_response(StatusCode::OK)
+    None
 }
 
 async fn file_response(
@@ -431,18 +487,21 @@ async fn file_response(
     response
 }
 
-fn tcp_port_for_path(fanout: &FanoutConfig, path: &str) -> Option<u16> {
+fn stream_target_for_path(fanout: &FanoutConfig, path: &str) -> Option<StreamTarget> {
+    if let Some(route) = fanout.streams.iter().find(|route| route.path == path) {
+        return Some(route.target.clone());
+    }
     fanout
-        .tcp_ranges
+        .stream_ranges
         .iter()
         .filter_map(|range| {
-            tcp_range_match(range, path).map(|port| (range.path_prefix.len(), port))
+            stream_range_match(range, path).map(|target| (range.path_prefix.len(), target))
         })
         .max_by_key(|(prefix_len, _)| *prefix_len)
-        .map(|(_, port)| port)
+        .map(|(_, target)| target)
 }
 
-fn tcp_range_match(range: &TcpRangeRoute, path: &str) -> Option<u16> {
+fn stream_range_match(range: &StreamRangeRoute, path: &str) -> Option<StreamTarget> {
     let suffix = path.strip_prefix(&range.path_prefix)?;
     if suffix.is_empty() || suffix.contains('/') {
         return None;
@@ -451,21 +510,24 @@ fn tcp_range_match(range: &TcpRangeRoute, path: &str) -> Option<u16> {
     if !(range.first..=range.last).contains(&index) {
         return None;
     }
-    range
-        .port_start
-        .checked_add(index.checked_sub(range.first)?)
+    let offset = index.checked_sub(range.first)?;
+    Some(StreamTarget::Tcp {
+        address: SocketAddr::new(range.host, range.port_start.checked_add(offset)?),
+    })
 }
 
-async fn tunnel_connect(
+async fn relay_stream<S>(
     frontend: hyper::upgrade::OnUpgrade,
-    mut backend: TcpStream,
+    mut backend: S,
     host: String,
-    port: u16,
-) {
+    target: String,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let frontend = match frontend.await {
         Ok(frontend) => frontend,
         Err(error) => {
-            debug!(%host, port, %error, "CONNECT upgrade failed");
+            debug!(%host, %target, %error, "CONNECT upgrade failed");
             return;
         }
     };
@@ -478,7 +540,7 @@ async fn tunnel_connect(
     )
     .await
     {
-        debug!(%host, port, %error, "fanout TCP tunnel ended with error");
+        debug!(%host, %target, %error, "stream tunnel ended with error");
     }
 }
 
@@ -681,20 +743,70 @@ mod tests {
     }
 
     #[test]
-    fn maps_numeric_fanout_paths_to_ports() {
+    fn parses_flat_stream_config() -> Result<(), Box<dyn std::error::Error>> {
+        let config: NodeConfig = toml::from_str(
+            r#"
+node_id = "test"
+domain = "example.com"
+
+[services]
+
+[fanouts.workers]
+
+[[fanouts.workers.streams]]
+path = "/control"
+transport = "unix-stream"
+socket = "/run/example/control.sock"
+
+
+[[fanouts.workers.stream_ranges]]
+path_prefix = "/tcp/"
+first = 1
+last = 30
+host = "127.0.0.1"
+port_start = 17400
+
+"#,
+        )?;
+        config.validate()?;
+        let fanout = &config.fanouts["workers"];
+        assert_eq!(fanout.streams.len(), 1);
+        assert_eq!(fanout.stream_ranges.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn maps_exact_and_numeric_fanout_paths_to_targets() {
         let fanout = FanoutConfig {
             files: Vec::new(),
-            tcp_ranges: vec![TcpRangeRoute {
-                path_prefix: "/".to_owned(),
+            streams: vec![certifex_core::StreamRoute {
+                path: "/control".to_owned(),
+                target: StreamTarget::UnixStream {
+                    socket: "/run/example/control.sock".into(),
+                },
+            }],
+            stream_ranges: vec![StreamRangeRoute {
+                path_prefix: "/tcp/".to_owned(),
                 first: 1,
                 last: 30,
+                host: IpAddr::from([127, 0, 0, 1]),
                 port_start: 17_400,
             }],
         };
-        assert_eq!(tcp_port_for_path(&fanout, "/1"), Some(17_400));
-        assert_eq!(tcp_port_for_path(&fanout, "/30"), Some(17_429));
-        assert_eq!(tcp_port_for_path(&fanout, "/0"), None);
-        assert_eq!(tcp_port_for_path(&fanout, "/31"), None);
-        assert_eq!(tcp_port_for_path(&fanout, "/1/extra"), None);
+        assert_eq!(
+            stream_target_for_path(&fanout, "/control"),
+            Some(StreamTarget::UnixStream {
+                socket: "/run/example/control.sock".into(),
+            })
+        );
+        assert_eq!(
+            stream_target_for_path(&fanout, "/tcp/1"),
+            Some(StreamTarget::Tcp {
+                address: SocketAddr::from(([127, 0, 0, 1], 17_400)),
+            })
+        );
+        assert_eq!(stream_target_for_path(&fanout, "/tcp/0"), None);
+        assert_eq!(stream_target_for_path(&fanout, "/tcp/31"), None);
+        assert_eq!(stream_target_for_path(&fanout, "/tcp/1/extra"), None);
     }
 }
