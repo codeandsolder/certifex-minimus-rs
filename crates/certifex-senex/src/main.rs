@@ -19,8 +19,8 @@ use axum::{
     routing::{get, post},
 };
 use certifex_core::{
-    CertificateBundle, IdentityError, NodeRegistration, RegistrationResponse,
-    csr_public_key_spki_der,
+    CertificateBundle, IdentityError, NodeRegistration, REGISTRAR_PORT, RegistrationResponse,
+    canonical_domain, csr_public_key_spki_der, registrar_hostname,
 };
 use clap::Parser;
 use cloudflare::{Cloudflare, CloudflareError};
@@ -44,7 +44,7 @@ const RENEWAL_FAILURE_BACKOFF_SECONDS: i64 = 6 * 60 * 60;
 #[command(version, about = "Certifex registrar and certificate control plane")]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:7443")]
-    listen: String,
+    listen: SocketAddr,
 
     #[arg(long)]
     domain: String,
@@ -90,6 +90,7 @@ struct AppState {
 
 struct Controller {
     domain: String,
+    registrar_hostname: String,
     telemetry: Telemetry,
     cloudflare: Cloudflare,
     issuer: AcmeIssuer,
@@ -110,6 +111,8 @@ struct StoredNode {
 enum ControllerError {
     #[error("hostname `{0}` is not below the configured domain")]
     OutsideDomain(String),
+    #[error("hostname `{0}` is reserved for the Certifex registrar")]
+    ReservedHostname(String),
     #[error("hostname `{name}` is already owned by node `{node_id}`")]
     NameCollision { name: String, node_id: String },
     #[error("claimed address is not a Tailscale IPv4 address: {0}")]
@@ -138,6 +141,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    let domain = canonical_domain(&args.domain)?;
+    let registrar_name = registrar_hostname(&domain)?;
+    let registrar_ip = registrar_publish_ip(args.listen)?;
     let metrics_instance = args
         .metrics_instance
         .clone()
@@ -150,7 +156,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let token = load_cloudflare_token(&args)?;
     let client = reqwest::Client::builder().build()?;
-    let cloudflare = Cloudflare::for_zone(client, token, &args.domain).await?;
+    let cloudflare = Cloudflare::for_zone(client, token, &domain).await?;
+    if let Some(ip) = registrar_ip {
+        cloudflare.ensure_a(&registrar_name, ip).await?;
+        info!(hostname = %registrar_name, %ip, "published registrar DNS record");
+    }
     let issuer = AcmeIssuer::load_or_create(
         cloudflare.clone(),
         &args.state_dir,
@@ -160,7 +170,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     let controller = Arc::new(
-        Controller::load(args.domain, args.state_dir, cloudflare, issuer, telemetry).await?,
+        Controller::load(
+            domain,
+            registrar_name,
+            args.state_dir,
+            cloudflare,
+            issuer,
+            telemetry,
+        )
+        .await?,
     );
     let state = AppState {
         controller: controller.clone(),
@@ -308,6 +326,7 @@ async fn register(
         }
         Err(
             error @ (ControllerError::OutsideDomain(_)
+            | ControllerError::ReservedHostname(_)
             | ControllerError::NameCollision { .. }
             | ControllerError::InvalidTailscaleIp(_)
             | ControllerError::NodeKeyMismatch(_)),
@@ -327,6 +346,7 @@ async fn register(
 impl Controller {
     async fn load(
         domain: String,
+        registrar_hostname: String,
         state_dir: PathBuf,
         cloudflare: Cloudflare,
         issuer: AcmeIssuer,
@@ -346,6 +366,7 @@ impl Controller {
         }
         Ok(Self {
             domain,
+            registrar_hostname,
             telemetry,
             cloudflare,
             issuer,
@@ -597,6 +618,9 @@ impl Controller {
             if !is_domain_descendant(name, &self.domain) {
                 return Err(ControllerError::OutsideDomain(name.clone()));
             }
+            if name == &self.registrar_hostname {
+                return Err(ControllerError::ReservedHostname(name.clone()));
+            }
         }
 
         let nodes = self.nodes.read().await;
@@ -773,6 +797,26 @@ fn is_tailscale_ipv4(ip: IpAddr) -> bool {
     octets[0] == 100 && (64..=127).contains(&octets[1])
 }
 
+fn registrar_publish_ip(listen: SocketAddr) -> io::Result<Option<IpAddr>> {
+    let ip = listen.ip();
+    if ip.is_loopback() {
+        return Ok(None);
+    }
+    if is_tailscale_ipv4(ip) {
+        if listen.port() != REGISTRAR_PORT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("tailnet registrar must listen on port {REGISTRAR_PORT}"),
+            ));
+        }
+        return Ok(Some(ip));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("registrar listen address must be loopback or Tailscale IPv4, got {ip}"),
+    ))
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -937,6 +981,22 @@ mod tests {
         assert_eq!(encoded_node_id("foo/bar"), "foo%2Fbar");
         assert_eq!(encoded_node_id("sf314-42"), "sf314-42");
     }
+    #[test]
+    fn registrar_publish_address_is_tailnet_only() -> io::Result<()> {
+        assert_eq!(
+            registrar_publish_ip(SocketAddr::from(([100, 118, 45, 4], 7443)))?,
+            Some(IpAddr::from([100, 118, 45, 4]))
+        );
+        assert_eq!(
+            registrar_publish_ip(SocketAddr::from(([127, 0, 0, 1], 7443)))?,
+            None
+        );
+        assert!(registrar_publish_ip(SocketAddr::from(([100, 118, 45, 4], 7444))).is_err());
+        assert!(registrar_publish_ip(SocketAddr::from(([0, 0, 0, 0], 7443))).is_err());
+        assert!(registrar_publish_ip(SocketAddr::from(([192, 168, 1, 2], 7443))).is_err());
+        Ok(())
+    }
+
     #[test]
     fn accepts_descendants_but_not_apex_or_lookalikes() {
         assert!(is_domain_descendant("grafana.onhir.eu", "onhir.eu"));

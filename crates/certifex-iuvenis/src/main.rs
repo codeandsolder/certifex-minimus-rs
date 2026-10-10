@@ -185,7 +185,7 @@ async fn reconcile(
         installed_generation,
     };
 
-    let endpoint = format!("{}/v1/register", config.registrar.trim_end_matches('/'));
+    let endpoint = format!("{}/v1/register", config.registrar_url()?);
     let response = client
         .post(endpoint)
         .json(&registration)

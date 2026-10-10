@@ -10,12 +10,14 @@ use thiserror::Error;
 pub const MAX_NODE_ID_BYTES: usize = 128;
 pub const MAX_HOSTNAMES: usize = 100;
 pub const MAX_CSR_PEM_BYTES: usize = 64 * 1024;
+pub const REGISTRAR_LABEL: &str = "certifex";
+pub const REGISTRAR_PORT: u16 = 7443;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     pub node_id: String,
     pub domain: String,
-    pub registrar: String,
     pub services: BTreeMap<String, u16>,
     #[serde(default)]
     pub fanouts: BTreeMap<String, FanoutConfig>,
@@ -65,6 +67,8 @@ pub enum ConfigError {
     EmptyDomain,
     #[error("invalid DNS label `{0}`")]
     InvalidLabel(String),
+    #[error("service or fanout name `{0}` is reserved")]
+    ReservedName(String),
     #[error("service `{0}` uses port 0")]
     ZeroPort(String),
     #[error("hostname for service or fanout `{0}` exceeds 253 bytes")]
@@ -179,11 +183,11 @@ impl NodeConfig {
             return Err(ConfigError::TooManyServices);
         }
 
-        let domain = normalize_domain(&self.domain)?;
-        validate_domain(&domain)?;
+        let domain = canonical_domain(&self.domain)?;
+        validate_hostname_length(REGISTRAR_LABEL, &domain)?;
 
         for (label, port) in &self.services {
-            validate_label(label)?;
+            validate_relative_name(label)?;
             validate_hostname_length(label, &domain)?;
             if *port == 0 {
                 return Err(ConfigError::ZeroPort(label.clone()));
@@ -193,7 +197,7 @@ impl NodeConfig {
             }
         }
         for (label, fanout) in &self.fanouts {
-            validate_label(label)?;
+            validate_relative_name(label)?;
             validate_hostname_length(label, &domain)?;
             if fanout.files.is_empty() && fanout.tcp_ranges.is_empty() {
                 return Err(ConfigError::EmptyFanout(label.clone()));
@@ -260,8 +264,40 @@ impl NodeConfig {
     /// Returns an error when the node configuration is invalid.
     pub fn canonical_domain(&self) -> Result<String, ConfigError> {
         self.validate()?;
-        normalize_domain(&self.domain)
+        canonical_domain(&self.domain)
     }
+
+    /// Returns the registrar control-plane URL derived from the base domain.
+    ///
+    /// # Errors
+    /// Returns an error when the configured base domain is invalid.
+    pub fn registrar_url(&self) -> Result<String, ConfigError> {
+        self.validate()?;
+        Ok(format!(
+            "http://{}:{REGISTRAR_PORT}",
+            registrar_hostname(&self.domain)?
+        ))
+    }
+}
+
+/// Normalizes and validates a base DNS domain.
+///
+/// # Errors
+/// Returns an error when the domain is empty or contains an invalid DNS label.
+pub fn canonical_domain(domain: &str) -> Result<String, ConfigError> {
+    let domain = normalize_domain(domain)?;
+    validate_domain(&domain)?;
+    Ok(domain)
+}
+
+/// Returns the reserved registrar hostname for a base domain.
+///
+/// # Errors
+/// Returns an error when the domain is invalid or the resulting hostname is too long.
+pub fn registrar_hostname(domain: &str) -> Result<String, ConfigError> {
+    let domain = canonical_domain(domain)?;
+    validate_hostname_length(REGISTRAR_LABEL, &domain)?;
+    Ok(format!("{REGISTRAR_LABEL}.{domain}"))
 }
 
 fn validate_hostname_length(label: &str, domain: &str) -> Result<(), ConfigError> {
@@ -387,6 +423,14 @@ fn validate_domain(domain: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_relative_name(name: &str) -> Result<(), ConfigError> {
+    validate_domain(name).map_err(|_| ConfigError::InvalidLabel(name.to_owned()))?;
+    if name == REGISTRAR_LABEL {
+        return Err(ConfigError::ReservedName(name.to_owned()));
+    }
+    Ok(())
+}
+
 fn validate_label(label: &str) -> Result<(), ConfigError> {
     let valid = !label.is_empty()
         && label.len() <= 63
@@ -410,10 +454,16 @@ mod tests {
         NodeConfig {
             node_id: "sf314-42".to_owned(),
             domain: "Onhir.EU.".to_owned(),
-            registrar: "https://certifex.onhir.eu".to_owned(),
             services: BTreeMap::from([("grafana".to_owned(), 3000), ("victoria".to_owned(), 8428)]),
             fanouts: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn registrar_is_derived_from_the_base_domain() -> Result<(), ConfigError> {
+        assert_eq!(registrar_hostname("Onhir.EU.")?, "certifex.onhir.eu");
+        assert_eq!(config().registrar_url()?, "http://certifex.onhir.eu:7443");
+        Ok(())
     }
 
     #[test]
@@ -426,12 +476,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_service_labels() {
+    fn nested_service_names_expand_below_the_base_domain() -> Result<(), ConfigError> {
         let mut config = config();
-        config.services.insert("bad.name".to_owned(), 443);
+        config.services.clear();
+        config.services.insert("exits.waw".to_owned(), 443);
+        assert_eq!(config.hostnames()?, ["exits.waw.onhir.eu"]);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_reserved_registrar_service_name() {
+        let mut config = config();
+        config.services.insert(REGISTRAR_LABEL.to_owned(), 7443);
         assert_eq!(
             config.validate(),
-            Err(ConfigError::InvalidLabel("bad.name".to_owned()))
+            Err(ConfigError::ReservedName(REGISTRAR_LABEL.to_owned()))
+        );
+    }
+
+    #[test]
+    fn rejects_bad_service_names() {
+        let mut config = config();
+        config.services.insert("bad..name".to_owned(), 443);
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::InvalidLabel("bad..name".to_owned()))
         );
     }
 
@@ -550,7 +619,7 @@ mod tests {
         .join(".");
         assert_eq!(
             hostname_too_long.validate(),
-            Err(ConfigError::HostnameTooLong("grafana".to_owned()))
+            Err(ConfigError::HostnameTooLong("certifex".to_owned()))
         );
     }
 

@@ -1,6 +1,5 @@
 node_id = "example-node"
 domain = "example.com"
-registrar = "http://100.64.0.1:7443"
 
 [services]
 grafana = 3000

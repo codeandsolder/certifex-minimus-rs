@@ -39,7 +39,7 @@ The DNS records are public, ordinary unproxied `A` records, but the destination 
 ### `certifex-iuvenis` — node/data plane
 
 - generates and retains the node P-256 private key locally;
-- derives service FQDNs from a tiny TOML config;
+- derives service FQDNs and the registrar endpoint (`certifex.<domain>:7443`) from a tiny TOML config;
 - sends only a signed CSR, node ID, service names, and observed Tailscale IPv4 to the registrar;
 - rejects certificate rollback;
 - verifies public trust, validity, every requested DNS name, the exact SAN set, and leaf SPKI equality with the local private key before installing a generation;
@@ -56,6 +56,8 @@ If persisted certificate state is corrupt or no longer matches the private key, 
 ### `certifex-senex` — registrar/control plane
 
 - owns the Cloudflare DNS credential and the ACME account, not node private keys;
+- publishes `certifex.<domain>` to its own Tailscale IPv4 when listening on the tailnet, so nodes never pin the registrar's address;
+- reserves that hostname from node registrations;
 - accepts only Tailscale IPv4 claims and rejects a remote registration whose TCP source address differs from the claimed address;
 - only permits names below the configured base domain;
 - keeps hostname ownership stable across restarts and rejects collisions between nodes;
@@ -74,16 +76,15 @@ If persisted certificate state is corrupt or no longer matches the private key, 
 ```toml
 node_id = "laptop"
 domain = "example.com"
-registrar = "http://100.64.0.1:7443"
 
 [services]
 grafana = 3000
 victoria = 8428
 ```
 
-This requests one certificate whose SAN set is exactly `grafana.example.com` and `victoria.example.com`, then routes those names to `127.0.0.1:3000` and `127.0.0.1:8428` respectively.
+This requests one certificate whose SAN set is exactly `grafana.example.com` and `victoria.example.com`, then routes those names to `127.0.0.1:3000` and `127.0.0.1:8428` respectively. The registrar endpoint is derived as `http://certifex.example.com:7443`.
 
-Service labels are intentionally one DNS label deep. Wildcards and arbitrary nested names are out of scope for v1.
+Service names are relative DNS names below the configured base domain, so a node can publish `exits.waw` as `exits.waw.example.com`. The exact name `certifex` is reserved for the registrar. Wildcards are out of scope for v1.
 
 ### Path fan-out services
 
