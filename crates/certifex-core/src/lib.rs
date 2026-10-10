@@ -35,6 +35,10 @@ pub struct FanoutConfig {
     pub streams: Vec<StreamRoute>,
     #[serde(default)]
     pub stream_ranges: Vec<StreamRangeRoute>,
+    #[serde(default)]
+    pub datagrams: Vec<DatagramRoute>,
+    #[serde(default)]
+    pub datagram_ranges: Vec<DatagramRangeRoute>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +70,29 @@ pub struct StreamRangeRoute {
     pub port_start: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatagramRoute {
+    pub path: String,
+    #[serde(flatten)]
+    pub target: DatagramTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "transport", rename_all = "kebab-case")]
+pub enum DatagramTarget {
+    Udp { address: SocketAddr },
+    UnixDatagram { socket: PathBuf },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatagramRangeRoute {
+    pub path_prefix: String,
+    pub first: u16,
+    pub last: u16,
+    pub host: IpAddr,
+    pub port_start: u16,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
     #[error("node_id must not be empty")]
@@ -86,6 +113,10 @@ pub enum ConfigError {
     InvalidStreamTarget(String),
     #[error("invalid stream range in fanout `{0}`")]
     InvalidStreamRange(String),
+    #[error("invalid datagram target in fanout `{0}`")]
+    InvalidDatagramTarget(String),
+    #[error("invalid datagram range in fanout `{0}`")]
+    InvalidDatagramRange(String),
     #[error("domain must not be empty")]
     EmptyDomain,
     #[error("invalid DNS label `{0}`")]
@@ -208,6 +239,25 @@ fn validate_stream_target(target: &StreamTarget) -> Result<(), ()> {
     }
 }
 
+fn validate_datagram_target(target: &DatagramTarget) -> Result<(), ()> {
+    match target {
+        DatagramTarget::Udp { address } => {
+            if address.ip().is_loopback() && address.port() != 0 {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+        DatagramTarget::UnixDatagram { socket } => {
+            if socket.is_absolute() {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
+}
+
 impl NodeConfig {
     /// Validates the node identifier, base domain, service labels, and ports.
     ///
@@ -244,6 +294,8 @@ impl NodeConfig {
             if fanout.files.is_empty()
                 && fanout.streams.is_empty()
                 && fanout.stream_ranges.is_empty()
+                && fanout.datagrams.is_empty()
+                && fanout.datagram_ranges.is_empty()
             {
                 return Err(ConfigError::EmptyFanout(label.clone()));
             }
@@ -292,6 +344,50 @@ impl NodeConfig {
                     let overlaps = !(left.last < right.first || right.last < left.first);
                     if left.path_prefix == right.path_prefix && overlaps {
                         return Err(ConfigError::InvalidStreamRange(label.clone()));
+                    }
+                }
+            }
+            for (index, route) in fanout.datagrams.iter().enumerate() {
+                validate_path(&route.path)?;
+                validate_datagram_target(&route.target)
+                    .map_err(|()| ConfigError::InvalidDatagramTarget(label.clone()))?;
+                if fanout.datagrams[index + 1..]
+                    .iter()
+                    .any(|other| other.path == route.path)
+                    || fanout
+                        .streams
+                        .iter()
+                        .any(|stream| stream.path == route.path)
+                {
+                    return Err(ConfigError::InvalidPath(route.path.clone()));
+                }
+            }
+            for range in &fanout.datagram_ranges {
+                validate_path_prefix(&range.path_prefix)?;
+                let Some(span) = range.last.checked_sub(range.first) else {
+                    return Err(ConfigError::InvalidDatagramRange(label.clone()));
+                };
+                let valid = range.host.is_loopback()
+                    && range.port_start != 0
+                    && range
+                        .port_start
+                        .checked_add(span)
+                        .is_some_and(|last_port| last_port != 0);
+                if !valid {
+                    return Err(ConfigError::InvalidDatagramRange(label.clone()));
+                }
+            }
+            for (index, left) in fanout.datagram_ranges.iter().enumerate() {
+                for right in &fanout.datagram_ranges[index + 1..] {
+                    let overlaps = !(left.last < right.first || right.last < left.first);
+                    if left.path_prefix == right.path_prefix && overlaps {
+                        return Err(ConfigError::InvalidDatagramRange(label.clone()));
+                    }
+                }
+                for right in &fanout.stream_ranges {
+                    let overlaps = !(left.last < right.first || right.last < left.first);
+                    if left.path_prefix == right.path_prefix && overlaps {
+                        return Err(ConfigError::InvalidDatagramRange(label.clone()));
                     }
                 }
             }
@@ -728,6 +824,8 @@ mod tests {
                     source: PathBuf::from("/run/example/inventory.json"),
                 }],
                 streams: Vec::new(),
+                datagrams: Vec::new(),
+                datagram_ranges: Vec::new(),
                 stream_ranges: vec![StreamRangeRoute {
                     path_prefix: "/".to_owned(),
                     first: 1,
@@ -755,6 +853,8 @@ mod tests {
                     },
                 }],
                 stream_ranges: Vec::new(),
+                datagrams: Vec::new(),
+                datagram_ranges: Vec::new(),
             },
         );
         assert_eq!(
@@ -773,11 +873,109 @@ mod tests {
                     },
                 }],
                 stream_ranges: Vec::new(),
+                datagrams: Vec::new(),
+                datagram_ranges: Vec::new(),
             },
         );
         assert_eq!(
             config.validate(),
             Err(ConfigError::InvalidStreamTarget("workers".to_owned()))
+        );
+    }
+
+    #[test]
+    fn fanout_rejects_invalid_and_ambiguous_datagrams() {
+        let mut config = config();
+        config.fanouts.insert(
+            "workers".to_owned(),
+            FanoutConfig {
+                files: Vec::new(),
+                streams: vec![StreamRoute {
+                    path: "/same".to_owned(),
+                    target: StreamTarget::Tcp {
+                        address: SocketAddr::from(([127, 0, 0, 1], 9000)),
+                    },
+                }],
+                stream_ranges: Vec::new(),
+                datagrams: vec![DatagramRoute {
+                    path: "/same".to_owned(),
+                    target: DatagramTarget::Udp {
+                        address: SocketAddr::from(([127, 0, 0, 1], 9001)),
+                    },
+                }],
+                datagram_ranges: Vec::new(),
+            },
+        );
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::InvalidPath("/same".to_owned()))
+        );
+
+        config.fanouts.insert(
+            "workers".to_owned(),
+            FanoutConfig {
+                files: Vec::new(),
+                streams: Vec::new(),
+                stream_ranges: Vec::new(),
+                datagrams: vec![DatagramRoute {
+                    path: "/remote".to_owned(),
+                    target: DatagramTarget::Udp {
+                        address: SocketAddr::from(([192, 0, 2, 10], 9001)),
+                    },
+                }],
+                datagram_ranges: Vec::new(),
+            },
+        );
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::InvalidDatagramTarget("workers".to_owned()))
+        );
+
+        config.fanouts.insert(
+            "workers".to_owned(),
+            FanoutConfig {
+                files: Vec::new(),
+                streams: Vec::new(),
+                stream_ranges: Vec::new(),
+                datagrams: vec![DatagramRoute {
+                    path: "/relative".to_owned(),
+                    target: DatagramTarget::UnixDatagram {
+                        socket: PathBuf::from("relative.sock"),
+                    },
+                }],
+                datagram_ranges: Vec::new(),
+            },
+        );
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::InvalidDatagramTarget("workers".to_owned()))
+        );
+
+        config.fanouts.insert(
+            "workers".to_owned(),
+            FanoutConfig {
+                files: Vec::new(),
+                streams: Vec::new(),
+                stream_ranges: vec![StreamRangeRoute {
+                    path_prefix: "/bank/".to_owned(),
+                    first: 1,
+                    last: 10,
+                    host: IpAddr::from([127, 0, 0, 1]),
+                    port_start: 17_400,
+                }],
+                datagrams: Vec::new(),
+                datagram_ranges: vec![DatagramRangeRoute {
+                    path_prefix: "/bank/".to_owned(),
+                    first: 5,
+                    last: 15,
+                    host: IpAddr::from([127, 0, 0, 1]),
+                    port_start: 18_400,
+                }],
+            },
+        );
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::InvalidDatagramRange("workers".to_owned()))
         );
     }
 
@@ -789,6 +987,8 @@ mod tests {
             FanoutConfig {
                 files: Vec::new(),
                 streams: Vec::new(),
+                datagrams: Vec::new(),
+                datagram_ranges: Vec::new(),
                 stream_ranges: vec![StreamRangeRoute {
                     path_prefix: "/".to_owned(),
                     first: 1,

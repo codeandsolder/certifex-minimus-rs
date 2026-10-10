@@ -10,7 +10,10 @@ use std::{
 
 use crate::telemetry::Telemetry;
 use bytes::Bytes;
-use certifex_core::{ConfigError, FanoutConfig, NodeConfig, StreamRangeRoute, StreamTarget};
+use certifex_core::{
+    ConfigError, DatagramRangeRoute, DatagramTarget, FanoutConfig, NodeConfig, StreamRangeRoute,
+    StreamTarget,
+};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, StatusCode, Uri, Version,
@@ -42,6 +45,8 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
+mod datagram;
+
 const FORWARDED: HeaderName = HeaderName::from_static("forwarded");
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
@@ -49,6 +54,7 @@ const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto
 const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
+const CAPSULE_PROTOCOL: HeaderName = HeaderName::from_static("capsule-protocol");
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TUNNEL_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -357,15 +363,25 @@ async fn fanout_request(
         return file_response(request.method(), route.source.as_path(), &host, &path).await;
     }
 
-    let Some(target) = stream_target_for_path(&fanout, &path) else {
-        return text_response(StatusCode::NOT_FOUND, "unknown fanout route\n");
-    };
+    if let Some(target) = stream_target_for_path(&fanout, &path) {
+        return stream_response(&mut request, host, target).await;
+    }
+    if let Some(target) = datagram_target_for_path(&fanout, &path) {
+        return datagram_response(&mut request, host, path, target).await;
+    }
+    text_response(StatusCode::NOT_FOUND, "unknown fanout route\n")
+}
 
+async fn stream_response(
+    request: &mut Request<Incoming>,
+    host: String,
+    target: StreamTarget,
+) -> Response<ProxyBody> {
+    if let Some(response) = require_stream_connect(request) {
+        return response;
+    }
     match target {
         StreamTarget::Tcp { address } => {
-            if let Some(response) = require_stream_connect(&request) {
-                return response;
-            }
             let backend = match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(address)).await {
                 Ok(Ok(stream)) => stream,
                 Ok(Err(error)) => {
@@ -380,47 +396,28 @@ async fn fanout_request(
                     );
                 }
             };
-            let frontend = hyper::upgrade::on(&mut request);
+            let frontend = hyper::upgrade::on(request);
             tokio::spawn(relay_stream(frontend, backend, host, address.to_string()));
             empty_response(StatusCode::OK)
         }
-        StreamTarget::UnixStream {
-            socket: socket_path,
-        } => {
-            if let Some(response) = require_stream_connect(&request) {
-                return response;
-            }
-            let backend =
-                match timeout(TCP_CONNECT_TIMEOUT, UnixStream::connect(&socket_path)).await {
-                    Ok(Ok(stream)) => stream,
-                    Ok(Err(error)) => {
-                        warn!(
-                            %host,
-                            path = %socket_path.display(),
-                            %error,
-                            "fanout Unix-stream backend unavailable"
-                        );
-                        return text_response(StatusCode::BAD_GATEWAY, "backend unavailable\n");
-                    }
-                    Err(_) => {
-                        warn!(
-                            %host,
-                            path = %socket_path.display(),
-                            "fanout Unix-stream backend connect timed out"
-                        );
-                        return text_response(
-                            StatusCode::GATEWAY_TIMEOUT,
-                            "backend connect timed out\n",
-                        );
-                    }
-                };
-            let frontend = hyper::upgrade::on(&mut request);
-            tokio::spawn(relay_stream(
-                frontend,
-                backend,
-                host,
-                socket_path.display().to_string(),
-            ));
+        StreamTarget::UnixStream { socket } => {
+            let backend = match timeout(TCP_CONNECT_TIMEOUT, UnixStream::connect(&socket)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    warn!(%host, path = %socket.display(), %error, "fanout Unix-stream backend unavailable");
+                    return text_response(StatusCode::BAD_GATEWAY, "backend unavailable\n");
+                }
+                Err(_) => {
+                    warn!(%host, path = %socket.display(), "fanout Unix-stream backend connect timed out");
+                    return text_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "backend connect timed out\n",
+                    );
+                }
+            };
+            let frontend = hyper::upgrade::on(request);
+            let target = socket.display().to_string();
+            tokio::spawn(relay_stream(frontend, backend, host, target));
             empty_response(StatusCode::OK)
         }
     }
@@ -440,6 +437,65 @@ fn require_stream_connect(request: &Request<Incoming>) -> Option<Response<ProxyB
         ));
     }
     None
+}
+
+async fn datagram_response(
+    request: &mut Request<Incoming>,
+    host: String,
+    route_path: String,
+    target: DatagramTarget,
+) -> Response<ProxyBody> {
+    if request.version() != Version::HTTP_11 {
+        return text_response(
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+            "datagram tunnel currently requires HTTP/1.1 Upgrade\n",
+        );
+    }
+    if request.method() != Method::GET
+        || !has_upgrade_token(request, datagram::UPGRADE_TOKEN)
+        || request
+            .headers()
+            .get(CAPSULE_PROTOCOL)
+            .is_none_or(|value| value != "?1")
+    {
+        return text_response(
+            StatusCode::BAD_REQUEST,
+            "datagram tunnel requires GET + Upgrade: certifex-datagram + Capsule-Protocol: ?1\n",
+        );
+    }
+
+    let backend = match target {
+        DatagramTarget::Udp { address } => datagram::Target::Udp(address),
+        DatagramTarget::UnixDatagram { socket } => datagram::Target::Unix(socket),
+    };
+    let frontend = hyper::upgrade::on(request);
+    if let Err(error) =
+        datagram::spawn_relay(frontend, backend, host.clone(), route_path.clone()).await
+    {
+        warn!(%host, path = %route_path, %error, "fanout datagram backend unavailable");
+        return text_response(StatusCode::BAD_GATEWAY, "backend unavailable\n");
+    }
+
+    let mut response = empty_response(StatusCode::SWITCHING_PROTOCOLS);
+    response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+    response
+        .headers_mut()
+        .insert(UPGRADE, HeaderValue::from_static(datagram::UPGRADE_TOKEN));
+    response
+        .headers_mut()
+        .insert(CAPSULE_PROTOCOL, HeaderValue::from_static("?1"));
+    response
+}
+
+fn has_upgrade_token<B>(request: &Request<B>, token: &str) -> bool {
+    is_upgrade_request(request)
+        && request
+            .headers()
+            .get(UPGRADE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case(token))
 }
 
 async fn file_response(
@@ -516,6 +572,35 @@ fn stream_range_match(range: &StreamRangeRoute, path: &str) -> Option<StreamTarg
     })
 }
 
+fn datagram_target_for_path(fanout: &FanoutConfig, path: &str) -> Option<DatagramTarget> {
+    if let Some(route) = fanout.datagrams.iter().find(|route| route.path == path) {
+        return Some(route.target.clone());
+    }
+    fanout
+        .datagram_ranges
+        .iter()
+        .filter_map(|range| {
+            datagram_range_match(range, path).map(|target| (range.path_prefix.len(), target))
+        })
+        .max_by_key(|(prefix_len, _)| *prefix_len)
+        .map(|(_, target)| target)
+}
+
+fn datagram_range_match(range: &DatagramRangeRoute, path: &str) -> Option<DatagramTarget> {
+    let suffix = path.strip_prefix(&range.path_prefix)?;
+    if suffix.is_empty() || suffix.contains('/') {
+        return None;
+    }
+    let index = suffix.parse::<u16>().ok()?;
+    if !(range.first..=range.last).contains(&index) {
+        return None;
+    }
+    let offset = index.checked_sub(range.first)?;
+    Some(DatagramTarget::Udp {
+        address: SocketAddr::new(range.host, range.port_start.checked_add(offset)?),
+    })
+}
+
 async fn relay_stream<S>(
     frontend: hyper::upgrade::OnUpgrade,
     mut backend: S,
@@ -587,7 +672,7 @@ fn normalize_host(value: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
-fn is_upgrade_request(request: &Request<Incoming>) -> bool {
+fn is_upgrade_request<B>(request: &Request<B>) -> bool {
     request.headers().contains_key(UPGRADE)
         && request
             .headers()
@@ -766,12 +851,26 @@ last = 30
 host = "127.0.0.1"
 port_start = 17400
 
+[[fanouts.workers.datagrams]]
+path = "/dns"
+transport = "udp"
+address = "127.0.0.1:5353"
+
+[[fanouts.workers.datagram_ranges]]
+path_prefix = "/udp/"
+first = 1
+last = 30
+host = "127.0.0.1"
+port_start = 18400
+
 "#,
         )?;
         config.validate()?;
         let fanout = &config.fanouts["workers"];
         assert_eq!(fanout.streams.len(), 1);
         assert_eq!(fanout.stream_ranges.len(), 1);
+        assert_eq!(fanout.datagrams.len(), 1);
+        assert_eq!(fanout.datagram_ranges.len(), 1);
         Ok(())
     }
 
@@ -784,6 +883,19 @@ port_start = 17400
                 target: StreamTarget::UnixStream {
                     socket: "/run/example/control.sock".into(),
                 },
+            }],
+            datagrams: vec![certifex_core::DatagramRoute {
+                path: "/dns".to_owned(),
+                target: DatagramTarget::Udp {
+                    address: SocketAddr::from(([127, 0, 0, 1], 5353)),
+                },
+            }],
+            datagram_ranges: vec![DatagramRangeRoute {
+                path_prefix: "/udp/".to_owned(),
+                first: 1,
+                last: 30,
+                host: IpAddr::from([127, 0, 0, 1]),
+                port_start: 18_400,
             }],
             stream_ranges: vec![StreamRangeRoute {
                 path_prefix: "/tcp/".to_owned(),
@@ -803,6 +915,18 @@ port_start = 17400
             stream_target_for_path(&fanout, "/tcp/1"),
             Some(StreamTarget::Tcp {
                 address: SocketAddr::from(([127, 0, 0, 1], 17_400)),
+            })
+        );
+        assert_eq!(
+            datagram_target_for_path(&fanout, "/dns"),
+            Some(DatagramTarget::Udp {
+                address: SocketAddr::from(([127, 0, 0, 1], 5353)),
+            })
+        );
+        assert_eq!(
+            datagram_target_for_path(&fanout, "/udp/30"),
+            Some(DatagramTarget::Udp {
+                address: SocketAddr::from(([127, 0, 0, 1], 18_429)),
             })
         );
         assert_eq!(stream_target_for_path(&fanout, "/tcp/0"), None);

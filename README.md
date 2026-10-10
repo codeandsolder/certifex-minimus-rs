@@ -108,11 +108,27 @@ first = 1
 last = 16
 host = "127.0.0.1"
 port_start = 9000
+
+[[fanouts.workers.datagrams]]
+path = "/dns"
+transport = "udp"
+address = "127.0.0.1:5353"
+
+[[fanouts.workers.datagram_ranges]]
+path_prefix = "/udp/"
+first = 1
+last = 16
+host = "127.0.0.1"
+port_start = 10000
 ```
 
-Exact stream targets support `tcp` and `unix-stream`; numeric stream ranges currently represent TCP port banks. IP targets must be loopback addresses and Unix socket paths must be absolute.
+Exact stream targets support `tcp` and `unix-stream`; numeric stream ranges represent TCP port banks. Exact datagram targets support `udp` and `unix-datagram`; numeric datagram ranges represent UDP port banks. IP targets must be loopback addresses and Unix socket paths must be absolute.
 
-A request such as `CONNECT /tcp/7` maps to `127.0.0.1:9006`; after the `200 OK`, the connection is a raw bidirectional byte stream. `CONNECT /control` reaches the configured Unix stream socket. File routes take precedence over stream routes. Stream relays use 64 KiB buffers, selected from the proxy-only benchmark rather than Tokio's 8 KiB default.
+A request such as `CONNECT /tcp/7` maps to `127.0.0.1:9006`; after the `200 OK`, the connection is a raw bidirectional byte stream. `CONNECT /control` reaches the configured Unix stream socket. Stream relays use 64 KiB buffers, selected from the proxy-only benchmark rather than Tokio's 8 KiB default.
+
+Datagram routes use HTTP/1.1 `GET` with `Connection: Upgrade`, `Upgrade: certifex-datagram`, and `Capsule-Protocol: ?1`. After `101 Switching Protocols`, each packet is carried as an RFC 9297 DATAGRAM capsule with context ID 0, preserving message boundaries. The upgrade token is intentionally Certifex-specific: RFC 9298 `connect-udp` identifies a client-selected `target_host` and `target_port`, while Certifex fanout routes select a server-configured local target. A standards-compliant CONNECT-UDP/H2/H3 frontend can be added later without changing the datagram backend adapters.
+
+Files take precedence over exact stream/datagram routes. Exact stream and datagram paths may not collide, and overlapping stream/datagram numeric ranges with the same prefix are rejected.
 
 ## Registrar startup
 
