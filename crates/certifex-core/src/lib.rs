@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, net::IpAddr, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+};
 
 use rcgen::{
     CertificateParams, CertificateSigningRequestParams, DistinguishedName, KeyPair, PublicKeyData,
@@ -28,7 +32,9 @@ pub struct FanoutConfig {
     #[serde(default)]
     pub files: Vec<FileRoute>,
     #[serde(default)]
-    pub tcp_ranges: Vec<TcpRangeRoute>,
+    pub tunnels: Vec<TunnelRoute>,
+    #[serde(default)]
+    pub ranges: Vec<TunnelRangeRoute>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,11 +44,35 @@ pub struct FileRoute {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TcpRangeRoute {
+pub struct TunnelRoute {
+    pub path: String,
+    #[serde(flatten)]
+    pub target: TunnelTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "transport", rename_all = "kebab-case")]
+pub enum TunnelTarget {
+    Tcp { address: SocketAddr },
+    UnixStream { socket: PathBuf },
+    Udp { address: SocketAddr },
+    UnixDatagram { socket: PathBuf },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelRangeRoute {
     pub path_prefix: String,
     pub first: u16,
     pub last: u16,
-    pub port_start: u16,
+    #[serde(flatten)]
+    pub target: PortRangeTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "transport", rename_all = "kebab-case")]
+pub enum PortRangeTarget {
+    Tcp { host: IpAddr, port_start: u16 },
+    Udp { host: IpAddr, port_start: u16 },
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -61,8 +91,10 @@ pub enum ConfigError {
     InvalidPath(String),
     #[error("fanout file source must be absolute: `{0}`")]
     RelativeFile(String),
-    #[error("invalid TCP range in fanout `{0}`")]
-    InvalidTcpRange(String),
+    #[error("invalid tunnel target in fanout `{0}`")]
+    InvalidTunnelTarget(String),
+    #[error("invalid tunnel range in fanout `{0}`")]
+    InvalidTunnelRange(String),
     #[error("domain must not be empty")]
     EmptyDomain,
     #[error("invalid DNS label `{0}`")]
@@ -166,6 +198,25 @@ impl NodeRegistration {
     }
 }
 
+fn validate_tunnel_target(target: &TunnelTarget) -> Result<(), ()> {
+    match target {
+        TunnelTarget::Tcp { address } | TunnelTarget::Udp { address } => {
+            if address.ip().is_loopback() && address.port() != 0 {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+        TunnelTarget::UnixStream { socket } | TunnelTarget::UnixDatagram { socket } => {
+            if socket.is_absolute() {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
+}
+
 impl NodeConfig {
     /// Validates the node identifier, base domain, service labels, and ports.
     ///
@@ -199,7 +250,7 @@ impl NodeConfig {
         for (label, fanout) in &self.fanouts {
             validate_relative_name(label)?;
             validate_hostname_length(label, &domain)?;
-            if fanout.files.is_empty() && fanout.tcp_ranges.is_empty() {
+            if fanout.files.is_empty() && fanout.tunnels.is_empty() && fanout.ranges.is_empty() {
                 return Err(ConfigError::EmptyFanout(label.clone()));
             }
             for (index, route) in fanout.files.iter().enumerate() {
@@ -216,22 +267,41 @@ impl NodeConfig {
                     return Err(ConfigError::InvalidPath(route.path.clone()));
                 }
             }
-            for range in &fanout.tcp_ranges {
-                validate_path_prefix(&range.path_prefix)?;
-                let span = range.last.checked_sub(range.first);
-                let last_port = span.and_then(|span| range.port_start.checked_add(span));
-                if range.first > range.last
-                    || range.port_start == 0
-                    || last_port.is_none_or(|port| port == 0)
+            for (index, route) in fanout.tunnels.iter().enumerate() {
+                validate_path(&route.path)?;
+                validate_tunnel_target(&route.target)
+                    .map_err(|()| ConfigError::InvalidTunnelTarget(label.clone()))?;
+                if fanout.tunnels[index + 1..]
+                    .iter()
+                    .any(|other| other.path == route.path)
                 {
-                    return Err(ConfigError::InvalidTcpRange(label.clone()));
+                    return Err(ConfigError::InvalidPath(route.path.clone()));
                 }
             }
-            for (index, left) in fanout.tcp_ranges.iter().enumerate() {
-                for right in &fanout.tcp_ranges[index + 1..] {
+            for range in &fanout.ranges {
+                validate_path_prefix(&range.path_prefix)?;
+                let Some(span) = range.last.checked_sub(range.first) else {
+                    return Err(ConfigError::InvalidTunnelRange(label.clone()));
+                };
+                let valid = match range.target {
+                    PortRangeTarget::Tcp { host, port_start }
+                    | PortRangeTarget::Udp { host, port_start } => {
+                        host.is_loopback()
+                            && port_start != 0
+                            && port_start
+                                .checked_add(span)
+                                .is_some_and(|last_port| last_port != 0)
+                    }
+                };
+                if !valid {
+                    return Err(ConfigError::InvalidTunnelRange(label.clone()));
+                }
+            }
+            for (index, left) in fanout.ranges.iter().enumerate() {
+                for right in &fanout.ranges[index + 1..] {
                     let overlaps = !(left.last < right.first || right.last < left.first);
                     if left.path_prefix == right.path_prefix && overlaps {
-                        return Err(ConfigError::InvalidTcpRange(label.clone()));
+                        return Err(ConfigError::InvalidTunnelRange(label.clone()));
                     }
                 }
             }
@@ -667,16 +737,60 @@ mod tests {
                     path: "/inventory.json".to_owned(),
                     source: PathBuf::from("/run/example/inventory.json"),
                 }],
-                tcp_ranges: vec![TcpRangeRoute {
+                tunnels: Vec::new(),
+                ranges: vec![TunnelRangeRoute {
                     path_prefix: "/".to_owned(),
                     first: 1,
                     last: 30,
-                    port_start: 17_400,
+                    target: PortRangeTarget::Tcp {
+                        host: IpAddr::from([127, 0, 0, 1]),
+                        port_start: 17_400,
+                    },
                 }],
             },
         );
         assert!(config.hostnames()?.contains(&"workers.onhir.eu".to_owned()));
         Ok(())
+    }
+
+    #[test]
+    fn fanout_rejects_nonlocal_and_relative_tunnel_targets() {
+        let mut config = config();
+        config.fanouts.insert(
+            "workers".to_owned(),
+            FanoutConfig {
+                files: Vec::new(),
+                tunnels: vec![TunnelRoute {
+                    path: "/remote".to_owned(),
+                    target: TunnelTarget::Tcp {
+                        address: SocketAddr::from(([192, 0, 2, 10], 9000)),
+                    },
+                }],
+                ranges: Vec::new(),
+            },
+        );
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::InvalidTunnelTarget("workers".to_owned()))
+        );
+
+        config.fanouts.insert(
+            "workers".to_owned(),
+            FanoutConfig {
+                files: Vec::new(),
+                tunnels: vec![TunnelRoute {
+                    path: "/relative".to_owned(),
+                    target: TunnelTarget::UnixDatagram {
+                        socket: PathBuf::from("relative.sock"),
+                    },
+                }],
+                ranges: Vec::new(),
+            },
+        );
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::InvalidTunnelTarget("workers".to_owned()))
+        );
     }
 
     #[test]
@@ -686,11 +800,15 @@ mod tests {
             "grafana".to_owned(),
             FanoutConfig {
                 files: Vec::new(),
-                tcp_ranges: vec![TcpRangeRoute {
+                tunnels: Vec::new(),
+                ranges: vec![TunnelRangeRoute {
                     path_prefix: "/".to_owned(),
                     first: 1,
                     last: 30,
-                    port_start: u16::MAX - 10,
+                    target: PortRangeTarget::Tcp {
+                        host: IpAddr::from([127, 0, 0, 1]),
+                        port_start: u16::MAX - 10,
+                    },
                 }],
             },
         );
@@ -702,7 +820,7 @@ mod tests {
         config.services.remove("grafana");
         assert_eq!(
             config.validate(),
-            Err(ConfigError::InvalidTcpRange("grafana".to_owned()))
+            Err(ConfigError::InvalidTunnelRange("grafana".to_owned()))
         );
     }
 }

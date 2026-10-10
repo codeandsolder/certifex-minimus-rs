@@ -10,7 +10,9 @@ use std::{
 
 use crate::telemetry::Telemetry;
 use bytes::Bytes;
-use certifex_core::{ConfigError, FanoutConfig, NodeConfig, TcpRangeRoute};
+use certifex_core::{
+    ConfigError, FanoutConfig, NodeConfig, PortRangeTarget, TunnelRangeRoute, TunnelTarget,
+};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, StatusCode, Uri, Version,
@@ -34,12 +36,15 @@ use rustls::{
 use thiserror::Error;
 use tokio::{
     fs,
-    net::{TcpListener, TcpStream},
+    io::{AsyncRead, AsyncWrite},
+    net::{TcpListener, TcpStream, UnixStream},
     sync::RwLock as AsyncRwLock,
     time::timeout,
 };
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
+
+mod datagram;
 
 const FORWARDED: HeaderName = HeaderName::from_static("forwarded");
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -48,6 +53,7 @@ const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto
 const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
+const CAPSULE_PROTOCOL: HeaderName = HeaderName::from_static("capsule-protocol");
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TUNNEL_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -351,39 +357,163 @@ async fn fanout_request(
     host: String,
     fanout: FanoutConfig,
 ) -> Response<ProxyBody> {
-    let path = request.uri().path();
+    let path = request.uri().path().to_owned();
     if let Some(route) = fanout.files.iter().find(|route| route.path == path) {
-        return file_response(request.method(), route.source.as_path(), &host, path).await;
+        return file_response(request.method(), route.source.as_path(), &host, &path).await;
     }
 
-    if request.method() != Method::CONNECT {
+    let Some(target) = tunnel_target_for_path(&fanout, &path) else {
         return text_response(StatusCode::NOT_FOUND, "unknown fanout route\n");
+    };
+
+    match target {
+        TunnelTarget::Tcp { address } => {
+            if let Some(response) = require_stream_connect(&request) {
+                return response;
+            }
+            let backend = match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(address)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    warn!(%host, %address, %error, "fanout TCP backend unavailable");
+                    return text_response(StatusCode::BAD_GATEWAY, "backend unavailable\n");
+                }
+                Err(_) => {
+                    warn!(%host, %address, "fanout TCP backend connect timed out");
+                    return text_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "backend connect timed out\n",
+                    );
+                }
+            };
+            let frontend = hyper::upgrade::on(&mut request);
+            tokio::spawn(tunnel_stream(frontend, backend, host, address.to_string()));
+            empty_response(StatusCode::OK)
+        }
+        TunnelTarget::UnixStream {
+            socket: socket_path,
+        } => {
+            if let Some(response) = require_stream_connect(&request) {
+                return response;
+            }
+            let backend =
+                match timeout(TCP_CONNECT_TIMEOUT, UnixStream::connect(&socket_path)).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        warn!(
+                            %host,
+                            path = %socket_path.display(),
+                            %error,
+                            "fanout Unix-stream backend unavailable"
+                        );
+                        return text_response(StatusCode::BAD_GATEWAY, "backend unavailable\n");
+                    }
+                    Err(_) => {
+                        warn!(
+                            %host,
+                            path = %socket_path.display(),
+                            "fanout Unix-stream backend connect timed out"
+                        );
+                        return text_response(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "backend connect timed out\n",
+                        );
+                    }
+                };
+            let frontend = hyper::upgrade::on(&mut request);
+            tokio::spawn(tunnel_stream(
+                frontend,
+                backend,
+                host,
+                socket_path.display().to_string(),
+            ));
+            empty_response(StatusCode::OK)
+        }
+        TunnelTarget::Udp { address } => {
+            datagram_response(&mut request, host, path, datagram::Target::Udp(address)).await
+        }
+        TunnelTarget::UnixDatagram {
+            socket: socket_path,
+        } => {
+            datagram_response(
+                &mut request,
+                host,
+                path,
+                datagram::Target::Unix(socket_path),
+            )
+            .await
+        }
     }
+}
+
+fn require_stream_connect(request: &Request<Incoming>) -> Option<Response<ProxyBody>> {
+    if request.method() != Method::CONNECT {
+        return Some(text_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "stream tunnel requires CONNECT\n",
+        ));
+    }
+    if request.version() != Version::HTTP_11 {
+        return Some(text_response(
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+            "stream tunnel requires HTTP/1.1 CONNECT\n",
+        ));
+    }
+    None
+}
+
+async fn datagram_response(
+    request: &mut Request<Incoming>,
+    host: String,
+    route_path: String,
+    target: datagram::Target,
+) -> Response<ProxyBody> {
     if request.version() != Version::HTTP_11 {
         return text_response(
             StatusCode::HTTP_VERSION_NOT_SUPPORTED,
-            "TCP fanout requires HTTP/1.1 CONNECT\n",
+            "datagram tunnel currently requires HTTP/1.1 Upgrade\n",
         );
     }
-    let Some(port) = tcp_port_for_path(&fanout, path) else {
-        return text_response(StatusCode::NOT_FOUND, "unknown fanout route\n");
-    };
-    let backend = match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(("127.0.0.1", port))).await
+    if request.method() != Method::GET
+        || !has_upgrade_token(request, datagram::UPGRADE_TOKEN)
+        || request
+            .headers()
+            .get(CAPSULE_PROTOCOL)
+            .is_none_or(|value| value != "?1")
     {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => {
-            warn!(%host, port, %error, "fanout TCP backend unavailable");
-            return text_response(StatusCode::BAD_GATEWAY, "backend unavailable\n");
-        }
-        Err(_) => {
-            warn!(%host, port, "fanout TCP backend connect timed out");
-            return text_response(StatusCode::GATEWAY_TIMEOUT, "backend connect timed out\n");
-        }
-    };
+        return text_response(
+            StatusCode::BAD_REQUEST,
+            "datagram tunnel requires GET + Upgrade: certifex-datagram + Capsule-Protocol: ?1\n",
+        );
+    }
 
-    let frontend = hyper::upgrade::on(&mut request);
-    tokio::spawn(tunnel_connect(frontend, backend, host, port));
-    empty_response(StatusCode::OK)
+    let frontend = hyper::upgrade::on(request);
+    if let Err(error) =
+        datagram::spawn_relay(frontend, target, host.clone(), route_path.clone()).await
+    {
+        warn!(%host, path = %route_path, %error, "fanout datagram backend unavailable");
+        return text_response(StatusCode::BAD_GATEWAY, "backend unavailable\n");
+    }
+
+    let mut response = empty_response(StatusCode::SWITCHING_PROTOCOLS);
+    response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+    response
+        .headers_mut()
+        .insert(UPGRADE, HeaderValue::from_static(datagram::UPGRADE_TOKEN));
+    response
+        .headers_mut()
+        .insert(CAPSULE_PROTOCOL, HeaderValue::from_static("?1"));
+    response
+}
+
+fn has_upgrade_token<B>(request: &Request<B>, token: &str) -> bool {
+    is_upgrade_request(request)
+        && request
+            .headers()
+            .get(UPGRADE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case(token))
 }
 
 async fn file_response(
@@ -431,18 +561,21 @@ async fn file_response(
     response
 }
 
-fn tcp_port_for_path(fanout: &FanoutConfig, path: &str) -> Option<u16> {
+fn tunnel_target_for_path(fanout: &FanoutConfig, path: &str) -> Option<TunnelTarget> {
+    if let Some(route) = fanout.tunnels.iter().find(|route| route.path == path) {
+        return Some(route.target.clone());
+    }
     fanout
-        .tcp_ranges
+        .ranges
         .iter()
         .filter_map(|range| {
-            tcp_range_match(range, path).map(|port| (range.path_prefix.len(), port))
+            tunnel_range_match(range, path).map(|target| (range.path_prefix.len(), target))
         })
         .max_by_key(|(prefix_len, _)| *prefix_len)
-        .map(|(_, port)| port)
+        .map(|(_, target)| target)
 }
 
-fn tcp_range_match(range: &TcpRangeRoute, path: &str) -> Option<u16> {
+fn tunnel_range_match(range: &TunnelRangeRoute, path: &str) -> Option<TunnelTarget> {
     let suffix = path.strip_prefix(&range.path_prefix)?;
     if suffix.is_empty() || suffix.contains('/') {
         return None;
@@ -451,21 +584,29 @@ fn tcp_range_match(range: &TcpRangeRoute, path: &str) -> Option<u16> {
     if !(range.first..=range.last).contains(&index) {
         return None;
     }
-    range
-        .port_start
-        .checked_add(index.checked_sub(range.first)?)
+    let offset = index.checked_sub(range.first)?;
+    match range.target {
+        PortRangeTarget::Tcp { host, port_start } => Some(TunnelTarget::Tcp {
+            address: SocketAddr::new(host, port_start.checked_add(offset)?),
+        }),
+        PortRangeTarget::Udp { host, port_start } => Some(TunnelTarget::Udp {
+            address: SocketAddr::new(host, port_start.checked_add(offset)?),
+        }),
+    }
 }
 
-async fn tunnel_connect(
+async fn tunnel_stream<S>(
     frontend: hyper::upgrade::OnUpgrade,
-    mut backend: TcpStream,
+    mut backend: S,
     host: String,
-    port: u16,
-) {
+    target: String,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let frontend = match frontend.await {
         Ok(frontend) => frontend,
         Err(error) => {
-            debug!(%host, port, %error, "CONNECT upgrade failed");
+            debug!(%host, %target, %error, "CONNECT upgrade failed");
             return;
         }
     };
@@ -478,7 +619,7 @@ async fn tunnel_connect(
     )
     .await
     {
-        debug!(%host, port, %error, "fanout TCP tunnel ended with error");
+        debug!(%host, %target, %error, "stream tunnel ended with error");
     }
 }
 
@@ -525,7 +666,7 @@ fn normalize_host(value: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
-fn is_upgrade_request(request: &Request<Incoming>) -> bool {
+fn is_upgrade_request<B>(request: &Request<B>) -> bool {
     request.headers().contains_key(UPGRADE)
         && request
             .headers()
@@ -681,20 +822,101 @@ mod tests {
     }
 
     #[test]
-    fn maps_numeric_fanout_paths_to_ports() {
+    fn parses_flat_generic_tunnel_config() -> Result<(), Box<dyn std::error::Error>> {
+        let config: NodeConfig = toml::from_str(
+            r#"
+node_id = "test"
+domain = "example.com"
+
+[services]
+
+[fanouts.workers]
+
+[[fanouts.workers.tunnels]]
+path = "/control"
+transport = "unix-stream"
+socket = "/run/example/control.sock"
+
+[[fanouts.workers.tunnels]]
+path = "/dns"
+transport = "udp"
+address = "127.0.0.1:5353"
+
+[[fanouts.workers.ranges]]
+path_prefix = "/tcp/"
+first = 1
+last = 30
+transport = "tcp"
+host = "127.0.0.1"
+port_start = 17400
+
+[[fanouts.workers.ranges]]
+path_prefix = "/udp/"
+first = 1
+last = 30
+transport = "udp"
+host = "127.0.0.1"
+port_start = 18400
+"#,
+        )?;
+        config.validate()?;
+        let fanout = &config.fanouts["workers"];
+        assert_eq!(fanout.tunnels.len(), 2);
+        assert_eq!(fanout.ranges.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn maps_exact_and_numeric_fanout_paths_to_targets() {
         let fanout = FanoutConfig {
             files: Vec::new(),
-            tcp_ranges: vec![TcpRangeRoute {
-                path_prefix: "/".to_owned(),
-                first: 1,
-                last: 30,
-                port_start: 17_400,
+            tunnels: vec![certifex_core::TunnelRoute {
+                path: "/control".to_owned(),
+                target: TunnelTarget::UnixStream {
+                    socket: "/run/example/control.sock".into(),
+                },
             }],
+            ranges: vec![
+                TunnelRangeRoute {
+                    path_prefix: "/tcp/".to_owned(),
+                    first: 1,
+                    last: 30,
+                    target: PortRangeTarget::Tcp {
+                        host: IpAddr::from([127, 0, 0, 1]),
+                        port_start: 17_400,
+                    },
+                },
+                TunnelRangeRoute {
+                    path_prefix: "/udp/".to_owned(),
+                    first: 1,
+                    last: 30,
+                    target: PortRangeTarget::Udp {
+                        host: IpAddr::from([127, 0, 0, 1]),
+                        port_start: 18_400,
+                    },
+                },
+            ],
         };
-        assert_eq!(tcp_port_for_path(&fanout, "/1"), Some(17_400));
-        assert_eq!(tcp_port_for_path(&fanout, "/30"), Some(17_429));
-        assert_eq!(tcp_port_for_path(&fanout, "/0"), None);
-        assert_eq!(tcp_port_for_path(&fanout, "/31"), None);
-        assert_eq!(tcp_port_for_path(&fanout, "/1/extra"), None);
+        assert_eq!(
+            tunnel_target_for_path(&fanout, "/control"),
+            Some(TunnelTarget::UnixStream {
+                socket: "/run/example/control.sock".into(),
+            })
+        );
+        assert_eq!(
+            tunnel_target_for_path(&fanout, "/tcp/1"),
+            Some(TunnelTarget::Tcp {
+                address: SocketAddr::from(([127, 0, 0, 1], 17_400)),
+            })
+        );
+        assert_eq!(
+            tunnel_target_for_path(&fanout, "/udp/2"),
+            Some(TunnelTarget::Udp {
+                address: SocketAddr::from(([127, 0, 0, 1], 18_401)),
+            })
+        );
+        assert_eq!(tunnel_target_for_path(&fanout, "/tcp/0"), None);
+        assert_eq!(tunnel_target_for_path(&fanout, "/tcp/31"), None);
+        assert_eq!(tunnel_target_for_path(&fanout, "/tcp/1/extra"), None);
     }
 }

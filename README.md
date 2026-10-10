@@ -88,7 +88,7 @@ Service names are relative DNS names below the configured base domain, so a node
 
 ### Path fan-out services
 
-A node can also publish one hostname that selects among multiple local TCP backends by URL path. This is useful for replica banks, test workers, sharded local services, or any other node-local set where creating one DNS name per backend would be needless.
+A node can also publish one hostname with file routes and typed local tunnels. Tunnel routing is transport-agnostic: stream targets use HTTP/1.1 `CONNECT`; datagram targets use an HTTP/1.1 Upgrade with RFC 9297 DATAGRAM capsules so packet boundaries are preserved.
 
 ```toml
 [fanouts.workers]
@@ -97,14 +97,38 @@ A node can also publish one hostname that selects among multiple local TCP backe
 path = "/inventory.json"
 source = "/run/workers/inventory.json"
 
-[[fanouts.workers.tcp_ranges]]
-path_prefix = "/"
+[[fanouts.workers.tunnels]]
+path = "/control"
+transport = "unix-stream"
+socket = "/run/workers/control.sock"
+
+[[fanouts.workers.tunnels]]
+path = "/dns"
+transport = "udp"
+address = "127.0.0.1:5353"
+
+[[fanouts.workers.ranges]]
+path_prefix = "/tcp/"
 first = 1
 last = 16
+transport = "tcp"
+host = "127.0.0.1"
 port_start = 9000
+
+[[fanouts.workers.ranges]]
+path_prefix = "/udp/"
+first = 1
+last = 16
+transport = "udp"
+host = "127.0.0.1"
+port_start = 10000
 ```
 
-The example requests `workers.example.com`; `port_start` is the backend port selected by `first`. `GET /inventory.json` and `HEAD /inventory.json` serve the current file directly with `Cache-Control: no-store`. An HTTP/1.1 `CONNECT /7` opens `127.0.0.1:9006`; after the `200 OK` response the connection is a raw bidirectional TCP tunnel. File routes take precedence over TCP ranges. Backends remain loopback-only by design.
+Exact tunnel targets support `tcp`, `unix-stream`, `udp`, and `unix-datagram`. Numeric ranges support TCP and UDP port banks. IP targets must be loopback addresses and Unix socket paths must be absolute.
+
+A stream request such as `CONNECT /tcp/7` maps to `127.0.0.1:9006`; after the `200 OK`, the connection is a raw bidirectional byte stream. A datagram request uses `GET`, `Connection: Upgrade`, `Upgrade: certifex-datagram`, and `Capsule-Protocol: ?1`; Certifex responds `101 Switching Protocols` and carries each datagram as an RFC 9297 DATAGRAM capsule with context ID 0. The `certifex-datagram` token is intentionally Certifex-specific because fanout routes select a server-configured destination; standards-compliant RFC 9298 `connect-udp` remains a separate future adapter whose client-supplied URI identifies `target_host` and `target_port`.
+
+File routes take precedence over tunnel routes. Stream relays use 64 KiB buffers, selected from the proxy-only benchmark rather than Tokio's 8 KiB default.
 
 ## Registrar startup
 
