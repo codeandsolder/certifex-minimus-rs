@@ -102,6 +102,48 @@ pub struct CertificateBundle {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistrationResponse {
     pub certificate: Option<CertificateBundle>,
+    #[serde(default)]
+    pub handoff_activation: Option<HandoffActivationChallenge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffActivationChallenge {
+    pub offer_id: String,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffActivationRequest {
+    pub offer_id: String,
+    pub node_id: String,
+    pub tailscale_ip: IpAddr,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffActivationResponse {
+    pub offer_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffOfferResponse {
+    pub offer_id: String,
+    pub target_node_id: String,
+    pub source_node_ids: Vec<String>,
+    pub hostnames: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffApproval {
+    pub offer_id: String,
+    pub source: NodeRegistration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffApprovalResponse {
+    pub offer_id: String,
+    pub ready: bool,
+    pub remaining_node_ids: Vec<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -621,6 +663,20 @@ mod tests {
             hostname_too_long.validate(),
             Err(ConfigError::HostnameTooLong("certifex".to_owned()))
         );
+    }
+
+    #[test]
+    fn registration_response_defaults_handoff_activation_for_old_json()
+    -> Result<(), serde_json::Error> {
+        let response: RegistrationResponse = serde_json::from_str(r#"{"certificate":null}"#)?;
+        assert_eq!(
+            response,
+            RegistrationResponse {
+                certificate: None,
+                handoff_activation: None,
+            }
+        );
+        Ok(())
     }
 
     #[test]

@@ -1,5 +1,6 @@
 mod acme;
 mod cloudflare;
+mod handoff;
 mod telemetry;
 
 use std::{
@@ -96,6 +97,8 @@ struct Controller {
     issuer: AcmeIssuer,
     nodes_dir: PathBuf,
     nodes: RwLock<BTreeMap<String, StoredNode>>,
+    handoffs_dir: PathBuf,
+    handoffs: RwLock<BTreeMap<String, handoff::StoredHandoff>>,
     reconcile: Mutex<()>,
 }
 
@@ -105,6 +108,18 @@ struct StoredNode {
     certificate: CertificateBundle,
     #[serde(default)]
     renewal: Option<RenewalSchedule>,
+    #[serde(default)]
+    released_hostnames: BTreeSet<String>,
+}
+
+impl StoredNode {
+    fn owns_hostname(&self, name: &str) -> bool {
+        self.registration
+            .hostnames
+            .iter()
+            .any(|candidate| candidate == name)
+            && !self.released_hostnames.contains(name)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -119,6 +134,43 @@ enum ControllerError {
     InvalidTailscaleIp(IpAddr),
     #[error("node_id `{0}` is already bound to a different node key")]
     NodeKeyMismatch(String),
+    #[error("no hostname collision exists; handoff is not needed")]
+    HandoffNotNeeded,
+    #[error("handoff offer `{0}` does not exist")]
+    HandoffNotFound(String),
+    #[error("node `{0}` is not a source for this handoff")]
+    HandoffApprovalNotSource(String),
+    #[error("handoff approval for `{node_id}` came from {actual}, expected {expected}")]
+    HandoffApprovalAddressMismatch {
+        node_id: String,
+        expected: IpAddr,
+        actual: IpAddr,
+    },
+    #[error("handoff `{offer_id}` is awaiting approval from {node_ids:?}")]
+    HandoffAwaitingApproval {
+        offer_id: String,
+        node_ids: Vec<String>,
+    },
+    #[error("hostname `{name}` is reserved for approved handoff target `{node_id}`")]
+    HandoffReserved { name: String, node_id: String },
+    #[error("hostname ownership changed while preparing handoff: `{0}`")]
+    HandoffOwnershipChanged(String),
+    #[error("hostname ownership changed after handoff offer `{0}` was created")]
+    HandoffSourcesChanged(String),
+    #[error("handoff `{offer_id}` requires source to keep serving `{name}` until activation")]
+    HandoffSourceMustKeepServing { offer_id: String, name: String },
+    #[error("handoff `{0}` has not prepared a destination certificate")]
+    HandoffNotPrepared(String),
+    #[error("handoff `{offer_id}` activation came from unexpected target `{node_id}`")]
+    HandoffActivationTargetMismatch { offer_id: String, node_id: String },
+    #[error(
+        "handoff `{offer_id}` activation generation {actual} differs from prepared generation {expected}"
+    )]
+    HandoffActivationGenerationMismatch {
+        offer_id: String,
+        expected: u64,
+        actual: u64,
+    },
     #[error("stored node identity is invalid: {0}")]
     Identity(#[from] IdentityError),
     #[error("Cloudflare error: {0}")]
@@ -193,6 +245,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/v1/register",
             post(register).layer(DefaultBodyLimit::max(MAX_REGISTRATION_BODY_BYTES)),
+        )
+        .route(
+            "/v1/handoff/offer",
+            post(handoff::offer).layer(DefaultBodyLimit::max(MAX_REGISTRATION_BODY_BYTES)),
+        )
+        .route(
+            "/v1/handoff/approve",
+            post(handoff::approve).layer(DefaultBodyLimit::max(MAX_REGISTRATION_BODY_BYTES)),
+        )
+        .route(
+            "/v1/handoff/activate",
+            post(handoff::activate).layer(DefaultBodyLimit::max(MAX_REGISTRATION_BODY_BYTES)),
         )
         .with_state(state);
 
@@ -329,7 +393,19 @@ async fn register(
             | ControllerError::ReservedHostname(_)
             | ControllerError::NameCollision { .. }
             | ControllerError::InvalidTailscaleIp(_)
-            | ControllerError::NodeKeyMismatch(_)),
+            | ControllerError::NodeKeyMismatch(_)
+            | ControllerError::HandoffNotNeeded
+            | ControllerError::HandoffNotFound(_)
+            | ControllerError::HandoffApprovalNotSource(_)
+            | ControllerError::HandoffApprovalAddressMismatch { .. }
+            | ControllerError::HandoffAwaitingApproval { .. }
+            | ControllerError::HandoffReserved { .. }
+            | ControllerError::HandoffOwnershipChanged(_)
+            | ControllerError::HandoffSourcesChanged(_)
+            | ControllerError::HandoffSourceMustKeepServing { .. }
+            | ControllerError::HandoffNotPrepared(_)
+            | ControllerError::HandoffActivationTargetMismatch { .. }
+            | ControllerError::HandoffActivationGenerationMismatch { .. }),
         ) => {
             state.controller.telemetry.registration_failed();
             warn!(%node_id, %error, "rejected registration");
@@ -354,6 +430,7 @@ impl Controller {
     ) -> Result<Self, ControllerError> {
         let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         let nodes_dir = state_dir.join("nodes");
+        let handoffs_dir = state_dir.join("handoffs");
         fs::create_dir_all(&nodes_dir).await?;
         let mut nodes = BTreeMap::new();
         let mut entries = fs::read_dir(&nodes_dir).await?;
@@ -364,6 +441,7 @@ impl Controller {
             let stored = serde_json::from_slice::<StoredNode>(&fs::read(entry.path()).await?)?;
             nodes.insert(stored.registration.node_id.clone(), stored);
         }
+        let handoffs = handoff::load_handoffs(&handoffs_dir).await?;
         Ok(Self {
             domain,
             registrar_hostname,
@@ -372,6 +450,8 @@ impl Controller {
             issuer,
             nodes_dir,
             nodes: RwLock::new(nodes),
+            handoffs_dir,
+            handoffs: RwLock::new(handoffs),
             reconcile: Mutex::new(()),
         })
     }
@@ -382,8 +462,14 @@ impl Controller {
     ) -> Result<RegistrationResponse, ControllerError> {
         let _serial = self.reconcile.lock().await;
         self.validate_registration_scope(&registration).await?;
+        if let Some(response) = self.reconcile_handoff(&registration).await? {
+            return Ok(response);
+        }
+        self.reject_hostname_conflicts(&registration).await?;
 
         let old = self.nodes.read().await.get(&registration.node_id).cloned();
+        self.guard_source_relinquish(&registration, old.as_ref())
+            .await?;
         if registration.hostnames.is_empty() {
             return self.deregister_node(&registration, old.as_ref()).await;
         }
@@ -399,6 +485,7 @@ impl Controller {
             registration: registration.clone(),
             certificate,
             renewal,
+            released_hostnames: BTreeSet::new(),
         };
         self.persist_node(&stored).await?;
         self.nodes
@@ -417,6 +504,7 @@ impl Controller {
 
         Ok(RegistrationResponse {
             certificate: response_certificate,
+            handoff_activation: None,
         })
     }
 
@@ -427,7 +515,9 @@ impl Controller {
     ) -> Result<RegistrationResponse, ControllerError> {
         if let Some(previous) = previous {
             for old_name in &previous.registration.hostnames {
-                self.cloudflare.delete_owned_a(old_name).await?;
+                if previous.owns_hostname(old_name) {
+                    self.cloudflare.delete_owned_a(old_name).await?;
+                }
             }
             let tombstone = deregistration_tombstone(registration, previous);
             self.persist_node(&tombstone).await?;
@@ -441,7 +531,10 @@ impl Controller {
                 "node relinquished its final managed hostname"
             );
         }
-        Ok(RegistrationResponse { certificate: None })
+        Ok(RegistrationResponse {
+            certificate: None,
+            handoff_activation: None,
+        })
     }
 
     async fn reconcile_dns(
@@ -457,7 +550,7 @@ impl Controller {
         if let Some(previous) = previous {
             let current = registration.hostnames.iter().collect::<BTreeSet<_>>();
             for old_name in &previous.registration.hostnames {
-                if !current.contains(old_name) {
+                if previous.owns_hostname(old_name) && !current.contains(old_name) {
                     self.cloudflare.delete_owned_a(old_name).await?;
                 }
             }
@@ -529,7 +622,7 @@ impl Controller {
         let Some(mut stored) = self.nodes.read().await.get(node_id).cloned() else {
             return Ok(());
         };
-        if stored.registration.hostnames.is_empty() {
+        if stored.registration.hostnames.is_empty() || !stored.released_hostnames.is_empty() {
             return Ok(());
         }
         let now = unix_now();
@@ -631,19 +724,6 @@ impl Controller {
                 registration.node_id.clone(),
             ));
         }
-        for (other_id, other) in nodes.iter() {
-            if other_id == &registration.node_id {
-                continue;
-            }
-            for name in &registration.hostnames {
-                if other.registration.hostnames.contains(name) {
-                    return Err(ControllerError::NameCollision {
-                        name: name.clone(),
-                        node_id: other_id.clone(),
-                    });
-                }
-            }
-        }
         drop(nodes);
         Ok(())
     }
@@ -730,6 +810,7 @@ fn deregistration_tombstone(registration: &NodeRegistration, previous: &StoredNo
         registration: registration.clone(),
         certificate: previous.certificate.clone(),
         renewal: None,
+        released_hostnames: BTreeSet::new(),
     }
 }
 
@@ -859,6 +940,42 @@ mod tests {
     }
 
     #[test]
+    fn released_hostname_is_no_longer_owned_without_rewriting_source_csr()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let identity = NodeIdentity::generate()?;
+        let names = vec!["one.example.com".to_owned(), "two.example.com".to_owned()];
+        let mut stored = StoredNode {
+            registration: NodeRegistration {
+                node_id: "old".to_owned(),
+                tailscale_ip: IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+                hostnames: names.clone(),
+                csr_pem: identity.csr_pem(&names)?,
+                installed_generation: Some(7),
+            },
+            certificate: CertificateBundle {
+                generation: 7,
+                hostnames: names,
+                certificate_chain_pem: "certificate".to_owned(),
+            },
+            renewal: None,
+            released_hostnames: BTreeSet::new(),
+        };
+        assert!(stored.owns_hostname("one.example.com"));
+        stored
+            .released_hostnames
+            .insert("one.example.com".to_owned());
+        assert!(!stored.owns_hostname("one.example.com"));
+        assert!(stored.owns_hostname("two.example.com"));
+        assert!(
+            stored
+                .registration
+                .hostnames
+                .contains(&"one.example.com".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn certificate_identity_uses_public_key_not_csr_bytes() -> Result<(), Box<dyn std::error::Error>>
     {
         let identity = NodeIdentity::generate()?;
@@ -896,6 +1013,7 @@ mod tests {
                 ari_window_start: None,
                 ari_window_end: None,
             }),
+            released_hostnames: BTreeSet::new(),
         };
         let replacement_identity = NodeIdentity::generate()?;
         let deregistration = NodeRegistration {

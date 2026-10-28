@@ -1,11 +1,15 @@
 use bytes::Bytes;
-use certifex_core::{NodeRegistration, RegistrationResponse};
+use certifex_core::{
+    HandoffActivationRequest, HandoffActivationResponse, HandoffApproval, HandoffApprovalResponse,
+    HandoffOfferResponse, NodeRegistration, RegistrationResponse,
+};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Request, StatusCode, header::CONTENT_TYPE};
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
+use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
@@ -14,7 +18,7 @@ type HttpClient = Client<HttpConnector, Full<Bytes>>;
 
 #[derive(Debug, Error)]
 pub enum RegistrarError {
-    #[error("failed to encode registration JSON: {0}")]
+    #[error("failed to encode registrar JSON: {0}")]
     EncodeJson(serde_json::Error),
     #[error("invalid registrar request: {0}")]
     Request(#[from] hyper::http::Error),
@@ -44,16 +48,51 @@ impl RegistrarClient {
     }
 
     /// Registers the node with the tailnet-only Certifex registrar.
-    ///
-    /// # Errors
-    /// Returns an error if the request cannot be encoded or sent, the response is too large,
-    /// the registrar returns a non-success status, or its JSON response is invalid.
     pub async fn register(
         &self,
         endpoint: &str,
         registration: &NodeRegistration,
     ) -> Result<RegistrationResponse, RegistrarError> {
-        let request = registration_request(endpoint, registration)?;
+        self.post_json(endpoint, registration).await
+    }
+
+    /// Creates or retrieves an explicit hostname handoff offer for this node registration.
+    pub async fn offer_handoff(
+        &self,
+        endpoint: &str,
+        registration: &NodeRegistration,
+    ) -> Result<HandoffOfferResponse, RegistrarError> {
+        self.post_json(endpoint, registration).await
+    }
+
+    /// Approves a pending handoff as one of its current source nodes.
+    pub async fn approve_handoff(
+        &self,
+        endpoint: &str,
+        approval: &HandoffApproval,
+    ) -> Result<HandoffApprovalResponse, RegistrarError> {
+        self.post_json(endpoint, approval).await
+    }
+
+    /// Confirms that a prepared handoff certificate has been installed by its destination.
+    pub async fn activate_handoff(
+        &self,
+        endpoint: &str,
+        activation: &HandoffActivationRequest,
+    ) -> Result<HandoffActivationResponse, RegistrarError> {
+        self.post_json(endpoint, activation).await
+    }
+
+    async fn post_json<RequestBody, ResponseBody>(
+        &self,
+        endpoint: &str,
+        body: &RequestBody,
+    ) -> Result<ResponseBody, RegistrarError>
+    where
+        RequestBody: Serialize + Sync,
+        ResponseBody: DeserializeOwned,
+    {
+        let request = json_request(endpoint, body)?;
         let response = self.client.request(request).await?;
         let status = response.status();
         let body = Limited::new(response.into_body(), MAX_RESPONSE_BODY_BYTES)
@@ -71,11 +110,11 @@ impl RegistrarClient {
     }
 }
 
-fn registration_request(
+fn json_request<T: Serialize>(
     endpoint: &str,
-    registration: &NodeRegistration,
+    value: &T,
 ) -> Result<Request<Full<Bytes>>, RegistrarError> {
-    let body = serde_json::to_vec(registration).map_err(RegistrarError::EncodeJson)?;
+    let body = serde_json::to_vec(value).map_err(RegistrarError::EncodeJson)?;
     Ok(Request::post(endpoint)
         .header(CONTENT_TYPE, "application/json")
         .body(Full::new(Bytes::from(body)))?)
@@ -156,7 +195,7 @@ mod tests {
     #[tokio::test]
     async fn request_is_plain_http_json_post() -> Result<(), Box<dyn std::error::Error>> {
         let registration = registration();
-        let request = registration_request(
+        let request = json_request(
             "http://certifex.example.com:7443/v1/register",
             &registration,
         )?;
@@ -177,7 +216,10 @@ mod tests {
 
     #[tokio::test]
     async fn client_round_trips_registration() -> Result<(), Box<dyn std::error::Error>> {
-        let response_body = serde_json::to_vec(&RegistrationResponse { certificate: None })?;
+        let response_body = serde_json::to_vec(&RegistrationResponse {
+            certificate: None,
+            handoff_activation: None,
+        })?;
         let (address, server) = spawn_response("200 OK", response_body).await?;
         let registration = registration();
         let endpoint = format!("http://{address}/v1/register");
@@ -186,7 +228,10 @@ mod tests {
             RegistrarClient::new()
                 .register(&endpoint, &registration)
                 .await?,
-            RegistrationResponse { certificate: None }
+            RegistrationResponse {
+                certificate: None,
+                handoff_activation: None,
+            }
         );
 
         let request = server
@@ -202,6 +247,62 @@ mod tests {
             serde_json::from_slice::<NodeRegistration>(&request[header_end + 4..])?,
             registration
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_round_trips_handoff_approval() -> Result<(), Box<dyn std::error::Error>> {
+        let response = HandoffApprovalResponse {
+            offer_id: "abc".to_owned(),
+            ready: true,
+            remaining_node_ids: Vec::new(),
+        };
+        let (address, server) = spawn_response("200 OK", serde_json::to_vec(&response)?).await?;
+        let approval = HandoffApproval {
+            offer_id: "abc".to_owned(),
+            source: NodeRegistration {
+                node_id: "old".to_owned(),
+                tailscale_ip: IpAddr::from([100, 64, 0, 2]),
+                hostnames: vec!["svc.example.com".to_owned()],
+                csr_pem: "csr".to_owned(),
+                installed_generation: Some(7),
+            },
+        };
+        let endpoint = format!("http://{address}/v1/handoff/approve");
+        assert_eq!(
+            RegistrarClient::new()
+                .approve_handoff(&endpoint, &approval)
+                .await?,
+            response
+        );
+        server
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_round_trips_handoff_activation() -> Result<(), Box<dyn std::error::Error>> {
+        let response = HandoffActivationResponse {
+            offer_id: "abc".to_owned(),
+        };
+        let (address, server) = spawn_response("200 OK", serde_json::to_vec(&response)?).await?;
+        let activation = HandoffActivationRequest {
+            offer_id: "abc".to_owned(),
+            node_id: "new".to_owned(),
+            tailscale_ip: IpAddr::from([100, 64, 0, 3]),
+            generation: 8,
+        };
+        let endpoint = format!("http://{address}/v1/handoff/activate");
+        assert_eq!(
+            RegistrarClient::new()
+                .activate_handoff(&endpoint, &activation)
+                .await?,
+            response
+        );
+        server
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))??;
         Ok(())
     }
 
