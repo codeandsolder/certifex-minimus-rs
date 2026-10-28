@@ -86,6 +86,18 @@ This requests one certificate whose SAN set is exactly `grafana.example.com` and
 
 Service names are relative DNS names below the configured base domain, so a node can publish `exits.waw` as `exits.waw.example.com`. The exact name `certifex` is reserved for the registrar. Wildcards are out of scope for v1.
 
+### Atomic hostname handoff
+
+A service hostname can move between Certifex nodes without first deleting its DNS record or exposing a TLS gap. The destination explicitly offers a handoff, every current source owner explicitly approves it, the registrar issues the destination certificate while DNS still points at the source, and only after the destination validates, installs, hot-loads, and explicitly acknowledges that prepared certificate does the registrar switch DNS and ownership.
+
+1. Add the service to the destination node config, but leave the source config unchanged.
+2. On the destination, run `certifex-iuvenis --offer-handoff` with the same `--config` and `--state-dir` used by its service. The command prints an `offer_id`, the source node IDs, and the hostnames that would move.
+3. On each printed source node, run `certifex-iuvenis --approve-handoff <offer_id>` with that node's normal config/state paths. The command signs the source's current hostname set with its existing node key; approval is accepted only from the source node's registered Tailscale address and only while its current config still contains every hostname it is authorizing.
+4. The destination's normal reconciliation loop obtains, validates, installs, and hot-loads the prepared certificate, then sends a dedicated handoff activation acknowledgment carrying the offer ID and prepared generation. The registrar durably releases ownership from the source, assigns it to the destination, and updates the A record only after that acknowledgment.
+5. After the commit, keep the source serving long enough for cached DNS answers to age out, then remove the moved service from the source config. Its next successful reconciliation replaces the old multi-SAN certificate without touching the destination's DNS record.
+
+The offer is bound to the destination node ID, Tailscale address, requested hostname set, and CSR public key. Final approval rechecks the complete ownership set; once ready, the handoff reserves the destination's entire requested hostname set, including names that were free when the offer was created. Ready offers survive registrar restarts so a competing node cannot race the transfer. Inactive pre-activation offers expire after seven days without progress. Once the destination explicitly activates the prepared certificate, the registrar durably marks the handoff as committing before changing ownership or DNS; that recovery record does not expire until the idempotent commit finishes. A source that has approved a handoff is prevented from relinquishing the transferred name through ordinary config reconciliation until the destination activates it.
+
 ### Path fan-out services
 
 A node can also publish one hostname that selects among multiple local TCP backends by URL path. This is useful for replica banks, test workers, sharded local services, or any other node-local set where creating one DNS name per backend would be needless.

@@ -10,7 +10,10 @@ use std::{
     time::Duration,
 };
 
-use certifex_core::{CertificateBundle, NodeConfig, NodeIdentity, NodeRegistration};
+use certifex_core::{
+    CertificateBundle, HandoffActivationRequest, HandoffApproval, NodeConfig, NodeIdentity,
+    NodeRegistration,
+};
 use clap::Parser;
 use proxy::ProxyState;
 use registrar::RegistrarClient;
@@ -43,6 +46,12 @@ struct Args {
     #[arg(long)]
     once: bool,
 
+    #[arg(long, conflicts_with_all = ["approve_handoff", "once"])]
+    offer_handoff: bool,
+
+    #[arg(long, value_name = "OFFER_ID", conflicts_with_all = ["offer_handoff", "once"])]
+    approve_handoff: Option<String>,
+
     #[arg(long)]
     metrics_endpoint: Option<String>,
 
@@ -74,9 +83,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &args.metrics_spool_dir,
     )?;
     let client = RegistrarClient::new();
+    let tailscale_ip = detect_tailscale_ip()?;
+    if args.offer_handoff || args.approve_handoff.is_some() {
+        run_handoff_command(&client, &args, tailscale_ip).await?;
+        return Ok(());
+    }
+
     let proxy = ProxyState::new(telemetry.clone());
     prepare_proxy(&args, &proxy)?;
-    let tailscale_ip = detect_tailscale_ip()?;
 
     if args.once {
         match reconcile(&client, &args, &proxy, tailscale_ip).await {
@@ -99,6 +113,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         result = &mut proxy_task => result.map_err(Into::into),
         result = &mut reconciliation_task => result,
     }
+}
+
+async fn run_handoff_command(
+    client: &RegistrarClient,
+    args: &Args,
+    tailscale_ip: IpAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config: NodeConfig = toml::from_str(&fs::read_to_string(&args.config)?)?;
+    let registrar = config.registrar_url()?;
+
+    if args.offer_handoff {
+        let hostnames = config.hostnames()?;
+        fs::create_dir_all(&args.state_dir)?;
+        let identity = load_or_create_identity(&args.state_dir.join("node-key.pem"))?;
+        let registration = NodeRegistration {
+            node_id: config.node_id.clone(),
+            tailscale_ip,
+            csr_pem: identity.csr_pem(&hostnames)?,
+            hostnames,
+            installed_generation: read_generation(&args.state_dir.join("certificate-generation"))?,
+        };
+        let response = client
+            .offer_handoff(&format!("{registrar}/v1/handoff/offer"), &registration)
+            .await?;
+        println!("offer_id={}", response.offer_id);
+        println!("target_node_id={}", response.target_node_id);
+        println!("source_node_ids={}", response.source_node_ids.join(","));
+        println!("hostnames={}", response.hostnames.join(","));
+        return Ok(());
+    }
+
+    if let Some(offer_id) = &args.approve_handoff {
+        let hostnames = config.hostnames()?;
+        fs::create_dir_all(&args.state_dir)?;
+        let identity = load_or_create_identity(&args.state_dir.join("node-key.pem"))?;
+        let approval = HandoffApproval {
+            offer_id: offer_id.clone(),
+            source: NodeRegistration {
+                node_id: config.node_id.clone(),
+                tailscale_ip,
+                csr_pem: identity.csr_pem(&hostnames)?,
+                hostnames,
+                installed_generation: read_generation(
+                    &args.state_dir.join("certificate-generation"),
+                )?,
+            },
+        };
+        let response = client
+            .approve_handoff(&format!("{registrar}/v1/handoff/approve"), &approval)
+            .await?;
+        println!("offer_id={}", response.offer_id);
+        println!("ready={}", response.ready);
+        println!(
+            "remaining_node_ids={}",
+            response.remaining_node_ids.join(",")
+        );
+    }
+    Ok(())
 }
 
 async fn reconciliation_loop(
@@ -213,6 +285,37 @@ async fn reconcile(
             generation = certificate.generation,
             "validated, installed, and activated certificate generation"
         );
+        if let Some(activation) = response.handoff_activation {
+            if activation.generation != certificate.generation {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "handoff activation generation differs from installed certificate",
+                )
+                .into());
+            }
+            client
+                .activate_handoff(
+                    &format!("{}/v1/handoff/activate", config.registrar_url()?),
+                    &HandoffActivationRequest {
+                        offer_id: activation.offer_id,
+                        node_id: config.node_id.clone(),
+                        tailscale_ip,
+                        generation: certificate.generation,
+                    },
+                )
+                .await?;
+            info!(
+                node_id = %config.node_id,
+                generation = certificate.generation,
+                "hostname handoff committed after destination certificate activation"
+            );
+        }
+    } else if response.handoff_activation.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "registrar requested hostname handoff activation without a certificate",
+        )
+        .into());
     } else {
         info!(
             node_id = %config.node_id,
