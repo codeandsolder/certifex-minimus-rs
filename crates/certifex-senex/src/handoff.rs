@@ -270,6 +270,7 @@ impl Controller {
         approval: &HandoffApproval,
     ) -> Result<HandoffApprovalResponse, ControllerError> {
         let _serial = self.reconcile.lock().await;
+        self.prune_expired_handoffs().await?;
         let mut handoff = self
             .handoffs
             .read()
@@ -500,8 +501,9 @@ impl Controller {
             return Ok(());
         };
         let handoffs = self.handoffs.read().await;
+        let now = unix_now();
         for handoff in handoffs.values() {
-            if !handoff.approvals.contains(&registration.node_id) {
+            if handoff.expired(now) || !handoff.approvals.contains(&registration.node_id) {
                 continue;
             }
             let Some(names) = handoff.sources.get(&registration.node_id) else {
@@ -548,8 +550,12 @@ impl Controller {
         registration: &NodeRegistration,
     ) -> Result<(), ControllerError> {
         let handoffs = self.handoffs.read().await;
+        let now = unix_now();
         for handoff in handoffs.values() {
-            if !handoff.ready() || handoff.target.node_id == registration.node_id {
+            if handoff.expired(now)
+                || !handoff.ready()
+                || handoff.target.node_id == registration.node_id
+            {
                 continue;
             }
             if handoff
@@ -625,7 +631,7 @@ impl Controller {
         candidate: &StoredHandoff,
     ) -> Result<(), ControllerError> {
         let handoffs = self.handoffs.read().await;
-        if let Some((name, node_id)) = conflicting_ready_handoff(&handoffs, candidate) {
+        if let Some((name, node_id)) = conflicting_ready_handoff(&handoffs, candidate, unix_now()) {
             return Err(ControllerError::HandoffReserved { name, node_id });
         }
         drop(handoffs);
@@ -747,6 +753,7 @@ impl Controller {
 fn conflicting_ready_handoff(
     handoffs: &BTreeMap<String, StoredHandoff>,
     candidate: &StoredHandoff,
+    now: i64,
 ) -> Option<(String, String)> {
     let candidate_names = candidate
         .target
@@ -755,7 +762,7 @@ fn conflicting_ready_handoff(
         .cloned()
         .collect::<BTreeSet<_>>();
     handoffs.values().find_map(|existing| {
-        if existing.id == candidate.id || !existing.ready() {
+        if existing.id == candidate.id || existing.expired(now) || !existing.ready() {
             return None;
         }
         existing
@@ -889,13 +896,17 @@ mod tests {
         assert!(second.ready());
         let handoffs = BTreeMap::from([(first.id.clone(), first.clone())]);
         assert_eq!(
-            conflicting_ready_handoff(&handoffs, &second),
+            conflicting_ready_handoff(&handoffs, &second, 1),
             Some(("free.example.com".to_owned(), "new-a".to_owned()))
+        );
+        assert_eq!(
+            conflicting_ready_handoff(&handoffs, &second, HANDOFF_OFFER_TTL_SECONDS + 2),
+            None
         );
         first.approvals.clear();
         second.approvals.clear();
         let handoffs = BTreeMap::from([(first.id.clone(), first)]);
-        assert_eq!(conflicting_ready_handoff(&handoffs, &second), None);
+        assert_eq!(conflicting_ready_handoff(&handoffs, &second, 1), None);
         Ok(())
     }
 
