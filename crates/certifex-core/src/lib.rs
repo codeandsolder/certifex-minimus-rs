@@ -24,6 +24,7 @@ pub struct NodeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FanoutConfig {
     #[serde(default)]
     pub files: Vec<FileRoute>,
@@ -32,12 +33,14 @@ pub struct FanoutConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileRoute {
     pub path: String,
     pub source: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TcpRangeRoute {
     pub path_prefix: String,
     pub first: u16,
