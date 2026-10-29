@@ -171,6 +171,8 @@ enum ControllerError {
         expected: u64,
         actual: u64,
     },
+    #[error("certificate generation counter is exhausted")]
+    GenerationExhausted,
     #[error("stored node identity is invalid: {0}")]
     Identity(#[from] IdentityError),
     #[error("Cloudflare error: {0}")]
@@ -598,7 +600,11 @@ impl Controller {
                 let replacement = replacement_chain(previous, registration);
                 self.issue_bundle(
                     registration,
-                    previous.certificate.generation.saturating_add(1),
+                    previous
+                        .certificate
+                        .generation
+                        .checked_add(1)
+                        .ok_or(ControllerError::GenerationExhausted)?,
                     replacement,
                 )
                 .await
@@ -649,7 +655,11 @@ impl Controller {
             .as_ref()
             .is_some_and(|schedule| schedule.renewal_due(now))
         {
-            let generation = stored.certificate.generation.saturating_add(1);
+            let generation = stored
+                .certificate
+                .generation
+                .checked_add(1)
+                .ok_or(ControllerError::GenerationExhausted)?;
             let old_chain = stored.certificate.certificate_chain_pem.clone();
             match self
                 .issue_bundle(&stored.registration, generation, Some(&old_chain))
