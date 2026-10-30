@@ -277,7 +277,7 @@ struct DnsRecord {
 
 #[derive(Debug, Deserialize)]
 struct DeleteResult {
-    #[allow(
+    #[expect(
         dead_code,
         reason = "successful decoding validates the Cloudflare delete response"
     )]
