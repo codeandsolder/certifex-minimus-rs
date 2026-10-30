@@ -28,6 +28,6 @@ jobs:
       - run: cargo test --locked --workspace --all-features
 
   strict-rust:
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@ca8e5368b41e5699095dd0458a3849ecb8db7712 # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@94a3b140fac9fc0b2d413871c247951afc660eff # main
     with:
       cargo-args: "--locked --workspace --all-targets --all-features"
