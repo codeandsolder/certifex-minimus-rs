@@ -1,6 +1,9 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
+  "extends": [
+    "config:recommended",
+    "github>codeandsolder/ci-workflows:renovate-ci-trust-root"
+  ],
   "dependencyDashboard": true,
   "minimumReleaseAge": "3 days",
   "minimumReleaseAgeBehaviour": "timestamp-required",
@@ -12,7 +15,13 @@
   "packageRules": [
     {
       "description": "Automerge ordinary compatible updates after CI",
-      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
       "matchCurrentVersion": "!/^0/",
       "automerge": true,
       "automergeType": "pr"
@@ -24,7 +33,22 @@
     },
     {
       "description": "Major updates stay open",
-      "matchUpdateTypes": ["major"],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "Trusted shared CI/strict policy updates bypass ordinary release age but never inherit broad automerge rules",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "/^codeandsolder\\/(?:ci-workflows|rust-skills2)(?:\\/|$)/"
+      ],
+      "minimumReleaseAge": null,
+      "groupName": "Shared CI trust roots",
+      "groupSlug": "shared-ci-trust-roots",
       "automerge": false
     }
   ]
