@@ -32,6 +32,6 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
 
   strict-rust:
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@442fb00af6f825b3b566f08fc23f962524dcce78 # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@d3fd9e6bfeee2d9a12c90ea17ed6c650b39fad9f # main
     with:
       cargo-args: "--locked --workspace --all-targets --all-features"
