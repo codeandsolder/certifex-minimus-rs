@@ -21,7 +21,7 @@ jobs:
           toolchain: 1.99.1
           components: rustfmt,clippy
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@be66a1ada16209be5b75d39724ef7383892d92cc # main
         with:
           rust-toolchain: "1.99.1"
       - run: cargo fmt --all -- --check
@@ -29,9 +29,9 @@ jobs:
       - run: cargo test --locked --workspace --all-features
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@be66a1ada16209be5b75d39724ef7383892d92cc # main
 
   strict-rust:
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@2e3e7dfc5742132bbae83ae7527a8549cd87d4f3 # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@432dc51cb588033b4f2836008e6814d1aedf3f55 # main
     with:
       cargo-args: "--locked --workspace --all-targets --all-features"
