@@ -18,12 +18,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: 1.99.1
+          toolchain: 1.100.0
           components: rustfmt,clippy
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
         with:
-          rust-toolchain: "1.99.1"
+          rust-toolchain: "1.100.0"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace --all-features
