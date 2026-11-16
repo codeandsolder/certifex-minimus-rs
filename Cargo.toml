@@ -4,7 +4,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/codeandsolder/certifex-minimus-rs"
 
@@ -13,6 +13,9 @@ unsafe_code = "forbid"
 unexpected_cfgs = "deny"
 unfulfilled_lint_expectations = "deny"
 unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.cargo]
+unused_dependencies = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
