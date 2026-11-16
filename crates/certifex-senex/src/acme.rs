@@ -381,6 +381,7 @@ async fn write_secret_json<T: serde::Serialize + Sync>(
     path: &Path,
     value: &T,
 ) -> Result<(), AcmeError> {
+    use std::{mem::DropGuard, os::unix::fs::OpenOptionsExt};
     use tokio::io::AsyncWriteExt;
 
     let bytes = serde_json::to_vec_pretty(value)?;
@@ -401,25 +402,24 @@ async fn write_secret_json<T: serde::Serialize + Sync>(
         })?;
     let temporary = parent.join(format!(".{filename}.{:016x}.tmp", fastrand::u64(..)));
 
-    let result = async {
-        let mut options = tokio::fs::OpenOptions::new();
-        options.write(true).create_new(true).mode(0o600);
-        let mut file = options.open(&temporary).await?;
-        file.write_all(&bytes).await?;
-        file.sync_all().await?;
-        drop(file);
+    // Install cleanup without an await between the exclusive create and guard.
+    // Only a successfully created file is ours to remove on cancellation.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let file = options.open(&temporary)?;
+    let cleanup = DropGuard::new(temporary, |path| {
+        let _ = std::fs::remove_file(path);
+    });
+    let mut file = tokio::fs::File::from_std(file);
+    file.write_all(&bytes).await?;
+    file.sync_all().await?;
+    drop(file);
 
-        fs::hard_link(&temporary, path).await?;
-        fs::remove_file(&temporary).await?;
-        tokio::fs::File::open(parent).await?.sync_all().await?;
-        Ok::<(), io::Error>(())
-    }
-    .await;
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary).await;
-    }
-    result.map_err(AcmeError::Io)
+    fs::hard_link(cleanup.as_path(), path).await?;
+    fs::remove_file(cleanup.as_path()).await?;
+    DropGuard::dismiss(cleanup);
+    tokio::fs::File::open(parent).await?.sync_all().await?;
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -467,6 +467,33 @@ mod tests {
         assert!(ari_certificate_id(&der).is_none());
         let fallback = fallback_schedule(&der)?;
         assert!(fallback.renew_after >= unix_now());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_secret_publish_removes_temporary_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory =
+            std::env::temp_dir().join(format!("certifex-secret-cancel-{:016x}", fastrand::u64(..)));
+        fs::create_dir_all(&directory).await?;
+        let path = directory.join("account.json");
+        let value = serde_json::json!({"generation": 1});
+
+        let mut future = Box::pin(write_secret_json(&path, &value));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(future.as_mut(), &mut context).is_pending());
+        drop(future);
+
+        assert!(!path.exists());
+        assert!(
+            fs::read_dir(&directory)
+                .await?
+                .next_entry()
+                .await?
+                .is_none()
+        );
+        fs::remove_dir_all(directory).await?;
         Ok(())
     }
 
