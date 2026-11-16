@@ -6,6 +6,7 @@ mod telemetry;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, io,
+    mem::DropGuard,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
@@ -796,23 +797,22 @@ async fn durable_replace(path: &std::path::Path, contents: &[u8]) -> io::Result<
         })?;
     let temporary = parent.join(format!(".{filename}.{:016x}.tmp", fastrand::u64(..)));
 
-    let result = async {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .await?;
-        file.write_all(contents).await?;
-        file.sync_all().await?;
-        drop(file);
-        fs::rename(&temporary, path).await?;
-        fs::File::open(parent).await?.sync_all().await
-    }
-    .await;
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary).await;
-    }
-    result
+    // Create before the first await: async open can create the file even
+    // after its future has been cancelled, before any cleanup guard exists.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let cleanup = DropGuard::new(temporary, |path| {
+        let _ = std::fs::remove_file(path);
+    });
+    let mut file = fs::File::from_std(file);
+    file.write_all(contents).await?;
+    file.sync_all().await?;
+    drop(file);
+    fs::rename(cleanup.as_path(), path).await?;
+    DropGuard::dismiss(cleanup);
+    fs::File::open(parent).await?.sync_all().await
 }
 
 fn deregistration_tombstone(registration: &NodeRegistration, previous: &StoredNode) -> StoredNode {
@@ -1101,6 +1101,26 @@ mod tests {
         }
         assert_eq!(count, 1);
 
+        fs::remove_dir_all(directory).await
+    }
+
+    #[tokio::test]
+    async fn cancelled_durable_replace_removes_temporary_file() -> io::Result<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "certifex-registrar-cancel-{:016x}",
+            fastrand::u64(..)
+        ));
+        fs::create_dir_all(&directory).await?;
+        let path = directory.join("node.json");
+
+        // The first poll creates the temp file before it starts async writing.
+        let mut future = Box::pin(durable_replace(&path, b"not committed"));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(future.as_mut(), &mut context).is_pending());
+        drop(future);
+
+        assert!(!path.exists());
+        assert!(fs::read_dir(&directory).await?.next_entry().await?.is_none());
         fs::remove_dir_all(directory).await
     }
 
