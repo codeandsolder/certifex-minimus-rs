@@ -1120,7 +1120,13 @@ mod tests {
         drop(future);
 
         assert!(!path.exists());
-        assert!(fs::read_dir(&directory).await?.next_entry().await?.is_none());
+        assert!(
+            fs::read_dir(&directory)
+                .await?
+                .next_entry()
+                .await?
+                .is_none()
+        );
         fs::remove_dir_all(directory).await
     }
 
