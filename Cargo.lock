@@ -909,7 +909,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "lurkmoar"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/lurkmoar-rs?rev=8211e12f838754c5094f146c98b79b969fba0a92#8211e12f838754c5094f146c98b79b969fba0a92"
+source = "git+https://github.com/codeandsolder/lurkmoar-rs?rev=b67e8dac65b93202774c8d4026308500deff10e5#b67e8dac65b93202774c8d4026308500deff10e5"
 dependencies = [
  "flate2",
  "tracing",
