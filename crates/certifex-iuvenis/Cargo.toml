@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 bytes = "1.12.1"
 certifex-core = { version = "0.1.0", path = "../certifex-core" }
-lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "7e1f2cb6dd9c7813ea13e68e42006c725e63d81b" }
+lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "8211e12f838754c5094f146c98b79b969fba0a92" }
 clap = { version = "4.6.7", features = ["derive"] }
 fastrand = "2.5.0"
 http-body-util = "0.1.5"
