@@ -397,13 +397,13 @@ impl NodeIdentity {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned PEM is needed to persist the node identity"]
     pub fn private_key_pem(&self) -> String {
         self.key_pair.serialize_pem()
     }
 
     /// Returns the node public key as DER-encoded `SubjectPublicKeyInfo`.
-    #[must_use]
+    #[must_use = "the returned DER bytes identify the node public key"]
     pub fn public_key_spki_der(&self) -> Vec<u8> {
         self.key_pair.subject_public_key_info()
     }

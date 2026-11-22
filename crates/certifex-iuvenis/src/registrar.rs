@@ -38,7 +38,7 @@ pub struct RegistrarClient {
 }
 
 impl RegistrarClient {
-    #[must_use]
+    #[must_use = "the returned client is needed for registrar requests"]
     pub fn new() -> Self {
         let mut connector = HttpConnector::new();
         connector.enforce_http(true);

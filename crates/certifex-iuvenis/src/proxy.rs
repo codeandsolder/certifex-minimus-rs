@@ -88,7 +88,7 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
-    #[must_use]
+    #[must_use = "the returned state owns the proxy routes and TLS configuration"]
     pub fn new(telemetry: Telemetry) -> Self {
         Self {
             tls: Arc::new(RwLock::new(None)),
@@ -97,7 +97,7 @@ impl ProxyState {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned reference provides access to the proxy telemetry"]
     pub const fn telemetry(&self) -> &Telemetry {
         &self.telemetry
     }
