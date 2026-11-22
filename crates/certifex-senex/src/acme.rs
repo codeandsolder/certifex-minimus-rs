@@ -29,12 +29,12 @@ pub struct RenewalSchedule {
 }
 
 impl RenewalSchedule {
-    #[must_use]
+    #[must_use = "the result determines whether certificate renewal should start"]
     pub const fn renewal_due(&self, now_unix: i64) -> bool {
         now_unix >= self.renew_after
     }
 
-    #[must_use]
+    #[must_use = "the result determines whether renewal information needs refreshing"]
     pub fn ari_refresh_due(&self, now_unix: i64) -> bool {
         self.ari_check_after
             .is_some_and(|deadline| now_unix >= deadline)
