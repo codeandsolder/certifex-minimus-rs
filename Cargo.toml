@@ -33,4 +33,4 @@ await_holding_lock = "deny"
 allow_attributes_without_reason = "deny"
 
 [patch.crates-io]
-zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast.git", rev = "885a59eda34738b64b424a383faad646239a6171" }
+zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast.git", rev = "1ec3a5612ee28803a7756fa52bd013389507a2db" }

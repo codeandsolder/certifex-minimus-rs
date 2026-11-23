@@ -2232,7 +2232,7 @@ dependencies = [
 [[package]]
 name = "zlib-rs"
 version = "0.6.8"
-source = "git+https://github.com/codeandsolder/zlib-rs-fast.git?rev=885a59eda34738b64b424a383faad646239a6171#885a59eda34738b64b424a383faad646239a6171"
+source = "git+https://github.com/codeandsolder/zlib-rs-fast.git?rev=1ec3a5612ee28803a7756fa52bd013389507a2db#1ec3a5612ee28803a7756fa52bd013389507a2db"
 
 [[package]]
 name = "zmij"
