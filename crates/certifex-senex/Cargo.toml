@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 axum = "0.8.9"
 certifex-core = { version = "0.1.0", path = "../certifex-core" }
-lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "149580beb19b5525ea8a9ac7068c9ea6b038b03a" }
+lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "b65ea856949839f8fc4500363837d76c651e9fd1" }
 clap = { version = "4.6.7", features = ["derive"] }
 fastrand = "2.5.0"
 instant-acme = { version = "0.8.5", default-features = false, features = ["hyper-rustls", "ring", "time", "x509-parser"] }
