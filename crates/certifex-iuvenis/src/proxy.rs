@@ -4,11 +4,17 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     path::Path,
+    pin::Pin,
     sync::{Arc, RwLock},
     time::Duration,
 };
 
 use crate::telemetry::Telemetry;
+use btls::{
+    pkey::PKey,
+    ssl::{AlpnError, Ssl, SslAcceptor, SslMethod, SslVersion, select_next_proto},
+    x509::X509,
+};
 use bytes::Bytes;
 use certifex_core::{ConfigError, FanoutConfig, NodeConfig, TcpRangeRoute};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
@@ -27,17 +33,12 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
 };
-use rustls::{
-    ServerConfig,
-    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
-};
 use thiserror::Error;
 use tokio::{
     fs,
     net::{TcpListener, TcpStream},
     time::timeout,
 };
-use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 const FORWARDED: HeaderName = HeaderName::from_static("forwarded");
@@ -71,7 +72,7 @@ pub enum ProxyError {
     #[error("proxy key PEM has unexpected tag `{0}`")]
     UnexpectedKeyTag(String),
     #[error("invalid TLS certificate/key pair: {0}")]
-    Tls(#[from] rustls::Error),
+    Tls(#[from] btls::error::ErrorStack),
     #[error("proxy TLS configuration lock is poisoned")]
     PoisonedTlsLock,
     #[error("proxy route table lock is poisoned")]
@@ -82,7 +83,7 @@ pub enum ProxyError {
 
 #[derive(Clone)]
 pub struct ProxyState {
-    tls: Arc<RwLock<Option<Arc<ServerConfig>>>>,
+    tls: Arc<RwLock<Option<Arc<SslAcceptor>>>>,
     routes: Arc<RwLock<BTreeMap<String, Route>>>,
     telemetry: Telemetry,
 }
@@ -139,8 +140,8 @@ impl ProxyState {
         let certificates = pem::parse_many(certificate_pem.as_bytes())?
             .into_iter()
             .filter(|block| block.tag() == "CERTIFICATE")
-            .map(|block| CertificateDer::from(block.into_contents()))
-            .collect::<Vec<_>>();
+            .map(|block| X509::from_der(block.contents()))
+            .collect::<Result<Vec<_>, _>>()?;
         if certificates.is_empty() {
             return Err(ProxyError::EmptyCertificateChain);
         }
@@ -148,12 +149,24 @@ impl ProxyState {
         if key.tag() != "PRIVATE KEY" {
             return Err(ProxyError::UnexpectedKeyTag(key.tag().to_owned()));
         }
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.into_contents()));
-        let mut config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certificates, key)?;
-        config.alpn_protocols = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
-        *self.tls.write().map_err(|_| ProxyError::PoisonedTlsLock)? = Some(Arc::new(config));
+        let key = PKey::private_key_from_pem(key_pem.as_bytes())?;
+        let mut config = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())?;
+        config.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+        let mut certificates = certificates.into_iter();
+        let leaf = certificates
+            .next()
+            .ok_or(ProxyError::EmptyCertificateChain)?;
+        config.set_certificate(&leaf)?;
+        for certificate in certificates {
+            config.add_extra_chain_cert(certificate)?;
+        }
+        config.set_private_key(&key)?;
+        config.check_private_key()?;
+        config.set_alpn_select_callback(|_, offered| {
+            select_next_proto(b"\x08http/1.1\x02h2", offered).ok_or(AlpnError::NOACK)
+        });
+        *self.tls.write().map_err(|_| ProxyError::PoisonedTlsLock)? =
+            Some(Arc::new(config.build()));
         Ok(())
     }
 
@@ -195,8 +208,16 @@ impl ProxyState {
             let client = client.clone();
             let telemetry = self.telemetry.clone();
             tokio::spawn(async move {
-                let acceptor = TlsAcceptor::from(tls_config);
-                let tls = match acceptor.accept(stream).await {
+                let handshake = async {
+                    let ssl = Ssl::new(tls_config.context())?;
+                    let mut tls = tokio_btls::SslStream::new(ssl, stream)?;
+                    Pin::new(&mut tls)
+                        .accept()
+                        .await
+                        .map_err(io::Error::other)?;
+                    Ok::<_, ProxyError>(tls)
+                };
+                let tls = match handshake.await {
                     Ok(tls) => tls,
                     Err(error) => {
                         telemetry.tls_handshake_failed();
@@ -242,7 +263,7 @@ impl ProxyState {
         Ok(())
     }
 
-    fn current_tls_config(&self) -> Result<Option<Arc<ServerConfig>>, ProxyError> {
+    fn current_tls_config(&self) -> Result<Option<Arc<SslAcceptor>>, ProxyError> {
         Ok(self
             .tls
             .read()
