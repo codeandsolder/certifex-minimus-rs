@@ -150,7 +150,7 @@ impl ProxyState {
             return Err(ProxyError::UnexpectedKeyTag(key.tag().to_owned()));
         }
         let key = PKey::private_key_from_pem(key_pem.as_bytes())?;
-        let mut config = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())?;
+        let mut config = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())?;
         config.set_min_proto_version(Some(SslVersion::TLS1_2))?;
         let mut certificates = certificates.into_iter();
         let leaf = certificates
