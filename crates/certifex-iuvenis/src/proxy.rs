@@ -164,7 +164,7 @@ impl ProxyState {
         config.check_private_key()?;
         config.set_alpn_select_callback(|_, offered| {
             select_next_proto(b"\x08http/1.1\x02h2", offered).ok_or(AlpnError::NOACK)
-        });
+        })?;
         *self.tls.write().map_err(|_| ProxyError::PoisonedTlsLock)? =
             Some(Arc::new(config.build()));
         Ok(())
@@ -175,7 +175,7 @@ impl ProxyState {
     /// # Errors
     /// Returns an error only if the listening socket cannot be created. Individual TLS or HTTP
     /// connection failures are logged and isolated to that connection.
-    pub async fn serve(self, ip: IpAddr, port: u16) -> Result<(), ProxyError> {
+    pub async fn serve(&self, ip: IpAddr, port: u16) -> Result<(), ProxyError> {
         let address = SocketAddr::new(ip, port);
         let listener = TcpListener::bind(address).await?;
         let mut connector = HttpConnector::new();

@@ -81,35 +81,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .or_else(|| std::env::var("HOSTNAME").ok())
         .unwrap_or_else(|| "unknown".to_string());
-    let telemetry = Telemetry::new(
+    let proxy = ProxyState::new(Telemetry::new(
         args.metrics_endpoint.as_deref(),
         &metrics_instance,
         &args.metrics_spool_dir,
-    )?;
-    let proxy = ProxyState::new(telemetry.clone());
+    )?);
     prepare_proxy(&args, &proxy)?;
 
-    if args.once {
+    let result = if args.once {
         let result = reconcile(&client, &args, &proxy, tailscale_ip).await;
-        drop(proxy);
         if result.is_ok() {
-            telemetry.reconcile_ok();
+            proxy.telemetry().reconcile_ok();
         } else {
-            telemetry.reconcile_failed();
+            proxy.telemetry().reconcile_failed();
         }
-        drop(telemetry);
-        return result.map(|_| ());
-    }
-
-    let proxy_task = proxy.clone().serve(tailscale_ip, args.https_port);
-    let reconciliation_task = reconciliation_loop(&client, &args, proxy, tailscale_ip, telemetry);
-    tokio::pin!(proxy_task);
-    tokio::pin!(reconciliation_task);
-
-    tokio::select! {
-        result = &mut proxy_task => result.map_err(Into::into),
-        result = &mut reconciliation_task => result,
-    }
+        result.map(|_| ())
+    } else {
+        tokio::select! {
+            result = proxy.serve(tailscale_ip, args.https_port) => result.map_err(Into::into),
+            result = reconciliation_loop(&client, &args, &proxy, tailscale_ip) => result,
+        }
+    };
+    drop(proxy);
+    result
 }
 
 async fn run_handoff_command(
@@ -173,9 +167,8 @@ async fn run_handoff_command(
 async fn reconciliation_loop(
     client: &RegistrarClient,
     args: &Args,
-    proxy: ProxyState,
+    proxy: &ProxyState,
     bound_tailscale_ip: IpAddr,
-    telemetry: Telemetry,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut baseline = fs::read(&args.config).unwrap_or_default();
     loop {
@@ -184,14 +177,14 @@ async fn reconciliation_loop(
         {
             return Err(tailscale_ip_changed(bound_tailscale_ip, current_ip).into());
         }
-        let delay = match reconcile(client, args, &proxy, bound_tailscale_ip).await {
+        let delay = match reconcile(client, args, proxy, bound_tailscale_ip).await {
             Ok(config_bytes) => {
-                telemetry.reconcile_ok();
+                proxy.telemetry().reconcile_ok();
                 baseline = config_bytes;
                 Duration::from_secs(args.poll_seconds.saturating_add(fastrand::u64(0..=900)))
             }
             Err(error) => {
-                telemetry.reconcile_failed();
+                proxy.telemetry().reconcile_failed();
                 warn!(%error, "registration failed; retrying");
                 Duration::from_secs(args.retry_seconds.saturating_add(fastrand::u64(0..=15)))
             }

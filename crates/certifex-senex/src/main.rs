@@ -256,9 +256,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             controller: controller.clone(),
         });
     let _renewal_task = tokio::spawn(renewal_loop(
-        controller,
+        Arc::clone(&controller),
         Duration::from_secs(args.renewal_check_seconds.max(1)),
     ));
+    drop(controller);
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     info!(listen = %args.listen, "certifex-senex listening");
