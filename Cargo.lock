@@ -222,7 +222,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 [[package]]
 name = "btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=a4b12ba7391e03470626504fad60d887be790cfb#a4b12ba7391e03470626504fad60d887be790cfb"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=53c46285a85742dc8c3ab48fbb66613da6b4a297#53c46285a85742dc8c3ab48fbb66613da6b4a297"
 dependencies = [
  "bitflags",
  "btls-sys",
@@ -234,10 +234,11 @@ dependencies = [
 [[package]]
 name = "btls-sys"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=a4b12ba7391e03470626504fad60d887be790cfb#a4b12ba7391e03470626504fad60d887be790cfb"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=53c46285a85742dc8c3ab48fbb66613da6b4a297#53c46285a85742dc8c3ab48fbb66613da6b4a297"
 dependencies = [
  "bindgen",
  "cmake",
+ "serde_json",
 ]
 
 [[package]]
@@ -1020,7 +1021,7 @@ dependencies = [
 [[package]]
 name = "lurkmoar"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/lurkmoar-rs?rev=0c49fad815ce76bbd63f0e8b79270db30968e289#0c49fad815ce76bbd63f0e8b79270db30968e289"
+source = "git+https://github.com/codeandsolder/lurkmoar-rs?rev=01b253e354a311920989f8859975f2134f29e81f#01b253e354a311920989f8859975f2134f29e81f"
 dependencies = [
  "bytes",
  "flate2",
@@ -1794,7 +1795,7 @@ dependencies = [
 [[package]]
 name = "tokio-btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=a4b12ba7391e03470626504fad60d887be790cfb#a4b12ba7391e03470626504fad60d887be790cfb"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=53c46285a85742dc8c3ab48fbb66613da6b4a297#53c46285a85742dc8c3ab48fbb66613da6b4a297"
 dependencies = [
  "btls",
  "btls-sys",
@@ -2289,7 +2290,7 @@ checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
 [[package]]
 name = "wreq"
 version = "0.16.1"
-source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=a8385c80ba6a5b035067d3a2e472d37df591faf0#a8385c80ba6a5b035067d3a2e472d37df591faf0"
+source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=7c0668c3b3e137f233c0aaee132028ab39572dbd#7c0668c3b3e137f233c0aaee132028ab39572dbd"
 dependencies = [
  "base64 0.23.1",
  "btls",
