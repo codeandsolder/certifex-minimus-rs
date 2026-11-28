@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 bytes = "1.12.1"
 certifex-core = { version = "0.1.0", path = "../certifex-core" }
-lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "68a4a057a9b32e4a45fe7530a2fbd0fdf2566f43" }
+lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "01b253e354a311920989f8859975f2134f29e81f" }
 clap = { version = "4.6.7", features = ["derive"] }
 fastrand = "2.5.0"
 http-body-util = "0.1.5"
@@ -19,12 +19,12 @@ if-addrs = "0.15.0"
 pem = "4.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "91fb0b88c9895f97c37f39a2db265742575a8096" }
+btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "53c46285a85742dc8c3ab48fbb66613da6b4a297" }
 rustls-pki-types = "1.15.1"
 webpki = { package = "rustls-webpki", version = "0.103", features = ["ring", "std"] }
 thiserror = "2.0.21"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util", "fs"] }
-tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "91fb0b88c9895f97c37f39a2db265742575a8096" }
+tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "53c46285a85742dc8c3ab48fbb66613da6b4a297" }
 toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
