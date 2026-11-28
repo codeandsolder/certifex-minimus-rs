@@ -1,12 +1,7 @@
-use std::sync::Arc;
-
 use certifex_core::{CertificateBundle, NodeIdentity};
-use rustls::{
-    RootCertStore,
-    client::{WebPkiServerVerifier, danger::ServerCertVerifier},
-    pki_types::{CertificateDer, ServerName, UnixTime},
-};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use thiserror::Error;
+use webpki::{ALL_VERIFICATION_ALGS, EndEntityCert, KeyUsage};
 use x509_parser::{extensions::GeneralName, prelude::FromDer};
 
 #[derive(Debug, Error)]
@@ -27,12 +22,10 @@ pub enum CertificateError {
     NonDnsSan,
     #[error("leaf certificate public key does not match the node private key")]
     PublicKeyMismatch,
-    #[error("cannot construct public trust verifier: {0}")]
-    Verifier(String),
     #[error("invalid DNS name `{0}`")]
     InvalidDnsName(String),
     #[error("certificate failed public trust validation for `{name}`: {source}")]
-    Trust { name: String, source: rustls::Error },
+    Trust { name: String, source: webpki::Error },
 }
 
 /// Validates a certificate bundle before it is installed on a node.
@@ -80,21 +73,32 @@ pub fn validate_bundle(
         return Err(CertificateError::PublicKeyMismatch);
     }
 
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let verifier = WebPkiServerVerifier::builder(Arc::new(roots))
-        .build()
-        .map_err(|error| CertificateError::Verifier(error.to_string()))?;
+    // Reuse the same WebPKI path and server-name verification directly,
+    // without importing a second TLS implementation for certificate checks.
+    let end_entity = EndEntityCert::try_from(leaf_der)
+        .map_err(|error| CertificateError::X509(error.to_string()))?;
     let intermediates = &certificates[1..];
     for name in expected_names {
         let server_name = ServerName::try_from(name.clone())
             .map_err(|_| CertificateError::InvalidDnsName(name.clone()))?;
-        verifier
-            .verify_server_cert(leaf_der, intermediates, &server_name, &[], UnixTime::now())
-            .map_err(|source| CertificateError::Trust {
-                name: name.clone(),
-                source,
-            })?;
+        let trust_error = |source| CertificateError::Trust {
+            name: name.clone(),
+            source,
+        };
+        let _verified = end_entity
+            .verify_for_usage(
+                ALL_VERIFICATION_ALGS,
+                webpki_roots::TLS_SERVER_ROOTS,
+                intermediates,
+                UnixTime::now(),
+                KeyUsage::server_auth(),
+                None,
+                None,
+            )
+            .map_err(trust_error)?;
+        end_entity
+            .verify_is_valid_for_subject_name(&server_name)
+            .map_err(trust_error)?;
     }
 
     Ok(())

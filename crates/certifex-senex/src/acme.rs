@@ -1,13 +1,16 @@
 use std::{
+    future::Future,
     io,
     path::Path,
+    pin::Pin,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use certifex_core::NodeRegistration;
 use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, CertificateIdentifier, ChallengeType,
-    Error as InstantAcmeError, Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
+    Account, AccountCredentials, AuthorizationStatus, BodyWrapper, BytesResponse,
+    CertificateIdentifier, ChallengeType, Error as InstantAcmeError, HttpClient, Identifier,
+    NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
 use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
@@ -17,6 +20,26 @@ use tracing::warn;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::cloudflare::{Cloudflare, CloudflareError};
+
+struct AcmeTransport(wreq::Client);
+
+impl HttpClient for AcmeTransport {
+    fn request(
+        &self,
+        request: http::Request<BodyWrapper<bytes::Bytes>>,
+    ) -> Pin<Box<dyn Future<Output = Result<BytesResponse, InstantAcmeError>> + Send>> {
+        let client = self.0.clone();
+        Box::pin(async move {
+            let request = wreq::Request::from(request.map(wreq::Body::wrap));
+            let response = client
+                .execute(request)
+                .await
+                .map_err(|error| InstantAcmeError::Other(Box::new(error)))?;
+            let response: http::Response<wreq::Body> = response.into();
+            Ok(BytesResponse::from(response))
+        })
+    }
+}
 
 const ARI_RETRY_AFTER_ERROR: Duration = Duration::from_secs(3600);
 
@@ -89,7 +112,15 @@ impl AcmeIssuer {
     ) -> Result<Self, AcmeError> {
         fs::create_dir_all(state_dir).await?;
         let credentials_path = state_dir.join("acme-account.json");
-        let builder = Account::builder()?;
+        let client = wreq::Client::builder()
+            .redirect(wreq::redirect::Policy::none())
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
+            .build()
+            .map_err(|error| InstantAcmeError::Other(Box::new(error)))?;
+        let builder = Account::builder_with_http(Box::new(AcmeTransport(client)));
         let account = if credentials_path.exists() {
             let credentials =
                 serde_json::from_slice::<AccountCredentials>(&fs::read(&credentials_path).await?)?;

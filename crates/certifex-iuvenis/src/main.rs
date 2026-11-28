@@ -64,24 +64,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|_| std::io::Error::other("failed to install Ring as rustls crypto provider"))?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
     let args = Args::parse();
-    let metrics_instance = args
-        .metrics_instance
-        .clone()
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .unwrap_or_else(|| "unknown".to_string());
-    let telemetry = Telemetry::new(
-        args.metrics_endpoint.as_deref(),
-        &metrics_instance,
-        &args.metrics_spool_dir,
-    )?;
     let client = RegistrarClient::new();
     let tailscale_ip = detect_tailscale_ip()?;
     if args.offer_handoff || args.approve_handoff.is_some() {
@@ -89,30 +76,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let proxy = ProxyState::new(telemetry.clone());
+    let metrics_instance = args
+        .metrics_instance
+        .clone()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    let proxy = ProxyState::new(Telemetry::new(
+        args.metrics_endpoint.as_deref(),
+        &metrics_instance,
+        &args.metrics_spool_dir,
+    )?);
     prepare_proxy(&args, &proxy)?;
 
-    if args.once {
-        match reconcile(&client, &args, &proxy, tailscale_ip).await {
-            Ok(_) => telemetry.reconcile_ok(),
-            Err(error) => {
-                telemetry.reconcile_failed();
-                return Err(error);
-            }
+    let result = if args.once {
+        let result = reconcile(&client, &args, &proxy, tailscale_ip).await;
+        if result.is_ok() {
+            proxy.telemetry().reconcile_ok();
+        } else {
+            proxy.telemetry().reconcile_failed();
         }
-        return Ok(());
-    }
-
-    let proxy_task = proxy.clone().serve(tailscale_ip, args.https_port);
-    let reconciliation_task =
-        reconciliation_loop(&client, &args, &proxy, tailscale_ip, telemetry.clone());
-    tokio::pin!(proxy_task);
-    tokio::pin!(reconciliation_task);
-
-    tokio::select! {
-        result = &mut proxy_task => result.map_err(Into::into),
-        result = &mut reconciliation_task => result,
-    }
+        result.map(|_| ())
+    } else {
+        tokio::select! {
+            result = proxy.serve(tailscale_ip, args.https_port) => result.map_err(Into::into),
+            result = reconciliation_loop(&client, &args, &proxy, tailscale_ip) => result,
+        }
+    };
+    drop(proxy);
+    result
 }
 
 async fn run_handoff_command(
@@ -178,7 +169,6 @@ async fn reconciliation_loop(
     args: &Args,
     proxy: &ProxyState,
     bound_tailscale_ip: IpAddr,
-    telemetry: Telemetry,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut baseline = fs::read(&args.config).unwrap_or_default();
     loop {
@@ -189,12 +179,12 @@ async fn reconciliation_loop(
         }
         let delay = match reconcile(client, args, proxy, bound_tailscale_ip).await {
             Ok(config_bytes) => {
-                telemetry.reconcile_ok();
+                proxy.telemetry().reconcile_ok();
                 baseline = config_bytes;
                 Duration::from_secs(args.poll_seconds.saturating_add(fastrand::u64(0..=900)))
             }
             Err(error) => {
-                telemetry.reconcile_failed();
+                proxy.telemetry().reconcile_failed();
                 warn!(%error, "registration failed; retrying");
                 Duration::from_secs(args.retry_seconds.saturating_add(fastrand::u64(0..=15)))
             }

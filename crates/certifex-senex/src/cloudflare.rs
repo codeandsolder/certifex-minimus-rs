@@ -1,8 +1,8 @@
 use std::net::IpAddr;
 
-use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
+use wreq::Client;
 
 const API_BASE: &str = "https://api.cloudflare.com/client/v4";
 const MANAGED_COMMENT: &str = "managed by certifex-minimus-rs";
@@ -10,7 +10,7 @@ const MANAGED_COMMENT: &str = "managed by certifex-minimus-rs";
 #[derive(Debug, Error)]
 pub enum CloudflareError {
     #[error("Cloudflare HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] wreq::Error),
     #[error("Cloudflare API rejected the request: {0}")]
     Api(String),
     #[error("Cloudflare token cannot access zone `{0}`")]
@@ -209,7 +209,7 @@ impl Cloudflare {
 
     async fn decode<T: DeserializeOwned>(
         &self,
-        response: reqwest::Response,
+        response: wreq::Response,
     ) -> Result<T, CloudflareError> {
         let response = response.error_for_status()?;
         let envelope = response.json::<Envelope<T>>().await?;

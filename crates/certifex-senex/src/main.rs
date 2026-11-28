@@ -188,9 +188,6 @@ enum ControllerError {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|_| std::io::Error::other("failed to install Ring as rustls crypto provider"))?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
@@ -210,7 +207,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &args.metrics_spool_dir,
     )?;
     let token = load_cloudflare_token(&args)?;
-    let client = reqwest::Client::builder().build()?;
+    let client = wreq::Client::builder()
+        .redirect(wreq::redirect::Policy::limited(10))
+        .build()?;
     let cloudflare = Cloudflare::for_zone(client, token, &domain).await?;
     if let Some(ip) = registrar_ip {
         cloudflare.ensure_a(&registrar_name, ip).await?;
@@ -235,14 +234,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?,
     );
-    let state = AppState {
-        controller: controller.clone(),
-    };
-    let _renewal_task = tokio::spawn(renewal_loop(
-        controller,
-        Duration::from_secs(args.renewal_check_seconds.max(1)),
-    ));
-
     let app = Router::new()
         .route("/healthz", get(health))
         .route(
@@ -261,7 +252,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/handoff/activate",
             post(handoff::activate).layer(DefaultBodyLimit::max(MAX_REGISTRATION_BODY_BYTES)),
         )
-        .with_state(state);
+        .with_state(AppState {
+            controller: controller.clone(),
+        });
+    let _renewal_task = tokio::spawn(renewal_loop(
+        Arc::clone(&controller),
+        Duration::from_secs(args.renewal_check_seconds.max(1)),
+    ));
+    drop(controller);
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     info!(listen = %args.listen, "certifex-senex listening");
@@ -437,7 +435,10 @@ impl Controller {
         fs::create_dir_all(&nodes_dir).await?;
         let mut nodes = BTreeMap::new();
         let mut entries = fs::read_dir(&nodes_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
+        loop {
+            let Some(entry) = entries.next_entry().await? else {
+                break;
+            };
             if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
