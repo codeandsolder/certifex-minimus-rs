@@ -234,14 +234,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?,
     );
-    let state = AppState {
-        controller: controller.clone(),
-    };
-    let _renewal_task = tokio::spawn(renewal_loop(
-        controller,
-        Duration::from_secs(args.renewal_check_seconds.max(1)),
-    ));
-
     let app = Router::new()
         .route("/healthz", get(health))
         .route(
@@ -260,7 +252,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/handoff/activate",
             post(handoff::activate).layer(DefaultBodyLimit::max(MAX_REGISTRATION_BODY_BYTES)),
         )
-        .with_state(state);
+        .with_state(AppState {
+            controller: controller.clone(),
+        });
+    let _renewal_task = tokio::spawn(renewal_loop(
+        controller,
+        Duration::from_secs(args.renewal_check_seconds.max(1)),
+    ));
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     info!(listen = %args.listen, "certifex-senex listening");
@@ -436,7 +434,10 @@ impl Controller {
         fs::create_dir_all(&nodes_dir).await?;
         let mut nodes = BTreeMap::new();
         let mut entries = fs::read_dir(&nodes_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
+        loop {
+            let Some(entry) = entries.next_entry().await? else {
+                break;
+            };
             if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }

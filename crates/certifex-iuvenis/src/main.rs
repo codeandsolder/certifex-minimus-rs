@@ -69,6 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    let client = RegistrarClient::new();
+    let tailscale_ip = detect_tailscale_ip()?;
+    if args.offer_handoff || args.approve_handoff.is_some() {
+        run_handoff_command(&client, &args, tailscale_ip).await?;
+        return Ok(());
+    }
+
     let metrics_instance = args
         .metrics_instance
         .clone()
@@ -79,30 +86,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &metrics_instance,
         &args.metrics_spool_dir,
     )?;
-    let client = RegistrarClient::new();
-    let tailscale_ip = detect_tailscale_ip()?;
-    if args.offer_handoff || args.approve_handoff.is_some() {
-        run_handoff_command(&client, &args, tailscale_ip).await?;
-        return Ok(());
-    }
-
     let proxy = ProxyState::new(telemetry.clone());
     prepare_proxy(&args, &proxy)?;
 
     if args.once {
-        match reconcile(&client, &args, &proxy, tailscale_ip).await {
-            Ok(_) => telemetry.reconcile_ok(),
-            Err(error) => {
-                telemetry.reconcile_failed();
-                return Err(error);
-            }
+        let result = reconcile(&client, &args, &proxy, tailscale_ip).await;
+        drop(proxy);
+        if result.is_ok() {
+            telemetry.reconcile_ok();
+        } else {
+            telemetry.reconcile_failed();
         }
-        return Ok(());
+        drop(telemetry);
+        return result.map(|_| ());
     }
 
     let proxy_task = proxy.clone().serve(tailscale_ip, args.https_port);
-    let reconciliation_task =
-        reconciliation_loop(&client, &args, &proxy, tailscale_ip, telemetry.clone());
+    let reconciliation_task = reconciliation_loop(&client, &args, proxy, tailscale_ip, telemetry);
     tokio::pin!(proxy_task);
     tokio::pin!(reconciliation_task);
 
@@ -173,7 +173,7 @@ async fn run_handoff_command(
 async fn reconciliation_loop(
     client: &RegistrarClient,
     args: &Args,
-    proxy: &ProxyState,
+    proxy: ProxyState,
     bound_tailscale_ip: IpAddr,
     telemetry: Telemetry,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -184,7 +184,7 @@ async fn reconciliation_loop(
         {
             return Err(tailscale_ip_changed(bound_tailscale_ip, current_ip).into());
         }
-        let delay = match reconcile(client, args, proxy, bound_tailscale_ip).await {
+        let delay = match reconcile(client, args, &proxy, bound_tailscale_ip).await {
             Ok(config_bytes) => {
                 telemetry.reconcile_ok();
                 baseline = config_bytes;
