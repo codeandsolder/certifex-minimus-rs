@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   check:
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@1293f1c247f07a14a85859f908b4f6b7e2553922 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@db22785ec97c653cf0ec96b6964ded8158436f3c # main
     with:
       command: |
         cargo fmt --all -- --check
@@ -22,6 +22,6 @@ jobs:
         cargo test --locked --workspace --all-features --release
 
   strict-rust:
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@535609a4878f34a6697afea7ba3da04a454cc5f4 # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@2defd2ef97352d7a32cddf2dc6350d685f5ed3d4 # main
     with:
       cargo-args: "--locked --workspace --all-targets --all-features"
